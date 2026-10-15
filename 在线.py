@@ -23,6 +23,10 @@ class Spider(BaseSpider):
             ),
             "Referer": self.host + "/",
         }
+        self.extend = {}
+        # 宿主 alist-tvbox 注入的地址与订阅 token（用来把网盘分享解析成分集）
+        self.atv_api = ""
+        self.atv_token = ""
         self.classes = [
             {"type_id": "1", "type_name": "电影"},
             {"type_id": "2", "type_name": "美剧"},
@@ -173,13 +177,56 @@ class Spider(BaseSpider):
         }
 
     def init(self, extend=""):
+        """宿主加载源时调用。
+
+        alist-tvbox 的 PyProxy 会把配置编码进 ext，形如：
+        {"loader":..., "api":"http://ip:4567", "source":..., "token":...,
+         "local_proxy_config":{...}}
+        其中 api 是宿主地址、token 是订阅 vod token —— 用它们即可调 /parse、/play
+        把网盘分享解析成真正的分集。另外兼容 {"host": "https://..."} 覆盖站点地址。
+        """
+        ext = self._normalize_ext(extend)
+        if not ext and isinstance(extend, str) and extend.strip():
+            # 兜底：部分宿主把 ext 以 base64 直接透传
+            try:
+                import base64 as _b64
+
+                raw = extend.strip()
+                raw += "=" * (-len(raw) % 4)
+                ext = self._normalize_ext(_b64.b64decode(raw).decode("utf-8", "ignore"))
+            except Exception:
+                ext = {}
+        self.extend = ext or {}
+        self.atv_api = str(self.extend.get("api") or self.extend.get("atv_api") or "").rstrip("/")
+        self.atv_token = str(self.extend.get("token") or self.extend.get("atv_token") or "")
+        host = str(self.extend.get("host") or "").strip()
+        if host.startswith("http"):
+            self.host = host.rstrip("/")
+            self.headers["Referer"] = self.host + "/"
         return None
+
+    def setExtendInfo(self, extend):
+        self.init(extend)
 
     def getName(self):
         return self.name
 
+    def isVideoFormat(self, url):
+        text = str(url or "").strip().lower().split("?")[0]
+        return text.endswith((".m3u8", ".mp4", ".mkv", ".flv", ".avi", ".ts", ".m4v", ".mov", ".rmvb", ".webm"))
+
+    def manualVideoCheck(self):
+        return False
+
     def danmaku(self):
         return True
+
+    def localProxy(self, param):
+        # FongMi 的 proxy:// 本地代理回调，本源不需要，返回 None 即可
+        return None
+
+    def destroy(self):
+        return None
 
     def homeContent(self, filter):
         return {"class": self.classes, "filters": self.filters}
@@ -492,6 +539,101 @@ class Spider(BaseSpider):
             grouped.setdefault(pan_type, []).append(f"{item['name']}${share_url}")
         return [{"from": key, "urls": "#".join(grouped[key])} for key in order if grouped.get(key)]
 
+    # ---------- 宿主 alist-tvbox 集成：把网盘分享解析成真正的分集 ----------
+
+    def _atv_ready(self):
+        return bool(self.atv_api and self.atv_token)
+
+    def _atv_http(self, method, url, body=None):
+        """调宿主接口。优先 requests（alist-tvbox 插件运行时提供），回退 self.fetch/self.post。"""
+        headers = {"User-Agent": self.headers.get("User-Agent", ""), "Accept": "application/json"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        try:
+            import requests
+
+            response = requests.request(method, url, json=body, headers=headers, timeout=20)
+            code = getattr(response, "status_code", 0) or 0
+            try:
+                return code, response.json()
+            except Exception:
+                return code, None
+        except Exception:
+            pass
+        try:
+            if str(method).upper() == "POST" and hasattr(self, "post"):
+                response = self.post(url, data=json.dumps(body or {}), headers=headers, timeout=20)
+            else:
+                response = self.fetch(url, headers=headers, timeout=20)
+        except Exception:
+            return 0, None
+        code = getattr(response, "status_code", 0) or 0
+        text = getattr(response, "text", "") or ""
+        try:
+            return code, json.loads(text)
+        except Exception:
+            return code, None
+
+    def _atv_parse_share(self, share_url, title=""):
+        """POST /parse/{token}：让宿主挂载网盘分享并返回标准 TvBox 详情（含全部分集）。"""
+        if not self._atv_ready() or not share_url:
+            return None
+        code, data = self._atv_http(
+            "POST",
+            f"{self.atv_api}/parse/{self.atv_token}",
+            {"url": share_url, "title": str(title or "")},
+        )
+        return data if (code == 200 and isinstance(data, dict)) else None
+
+    def _atv_resolve_play(self, play_id):
+        """GET /play/{token}?id=<集id>：把宿主的集 id 换成真实播放地址（含 header）。"""
+        if not self._atv_ready() or not play_id:
+            return None
+        code, data = self._atv_http(
+            "GET",
+            f"{self.atv_api}/play/{self.atv_token}?id={quote(str(play_id), safe='')}",
+        )
+        if code != 200 or not isinstance(data, dict) or not data.get("url"):
+            return None
+        url = str(data["url"])
+        if url.startswith("/"):
+            url = self.atv_api + url
+        result = {"url": url}
+        if isinstance(data.get("header"), dict):
+            result["header"] = data["header"]
+        return result
+
+    def _looks_like_atv_id(self, value):
+        """判断是否是宿主解析出来的集 id（形如 1@12345 / 1@12345@a@b / 1$/path）。"""
+        text = str(value or "").strip()
+        if not text or text.startswith("http"):
+            return False
+        if text.startswith("1$"):
+            return True
+        return "@" in text and text.split("@", 1)[0].isdigit()
+
+    def _merge_atv_lines(self, detail, fallback_name, play_from, play_url):
+        """把宿主详情里的网盘线路并入播放线路；单条时用网盘名，多条保留宿主命名。"""
+        items = detail.get("list") if isinstance(detail, dict) else None
+        if not items or not isinstance(items[0], dict):
+            return False
+        vod = items[0]
+        names = [x.strip() for x in str(vod.get("vod_play_from") or "").split("$$$")]
+        lines = str(vod.get("vod_play_url") or "").split("$$$")
+        merged = []
+        for index, name in enumerate(names):
+            line = lines[index] if index < len(lines) else ""
+            if name and line.strip():
+                merged.append((name, line))
+        if not merged:
+            return False
+        if len(merged) == 1 and fallback_name:
+            merged[0] = (fallback_name, merged[0][1])
+        for name, line in merged:
+            play_from.append(name)
+            play_url.append(line)
+        return True
+
     def detailContent(self, ids):
         raw_id = str(ids[0]).strip()
         url = raw_id if raw_id.startswith("http") else self._build_detail_url(raw_id)
@@ -521,7 +663,16 @@ class Spider(BaseSpider):
             play_from.append("zxzj")
             play_url.append("#".join(playlists["normal"]))
         for group in pan_groups:
-            play_from.append(pan_names.get(group["from"], group["from"]))
+            line_name = pan_names.get(group["from"], group["from"])
+            share_url = ""
+            first = group["urls"].split("#")[0]
+            if "$" in first:
+                share_url = first.split("$", 1)[1]
+            # 跑在 alist-tvbox 里时，把分享交给宿主解析成真正的分集；失败则透传分享链接
+            expanded = self._atv_parse_share(share_url, meta.get("vod_name", "")) if share_url else None
+            if expanded and self._merge_atv_lines(expanded, line_name, play_from, play_url):
+                continue
+            play_from.append(line_name)
             play_url.append(group["urls"])
         vod = {
             "vod_id": raw_id,
@@ -578,6 +729,21 @@ class Spider(BaseSpider):
 
     def playerContent(self, flag, id, vipFlags):
         raw_id = str(id or "").strip()
+
+        # 1) 网盘分享被宿主 alist-tvbox 解析出的分集（形如 1@12345）：交给宿主换真实地址
+        if self._looks_like_atv_id(raw_id):
+            resolved = self._atv_resolve_play(raw_id)
+            if resolved:
+                return {
+                    "parse": 0,
+                    "jx": 0,
+                    "playUrl": "",
+                    "url": resolved["url"],
+                    "header": resolved.get("header") or {},
+                }
+            return {"parse": 1, "jx": 1, "playUrl": "", "url": "", "header": {}}
+
+        # 2) 网盘分享链接（宿主未解析时的透传，交给客户端网盘能力）
         if self._detect_pan_type("", raw_id):
             return {"parse": 0, "jx": 0, "playUrl": "", "url": raw_id, "header": {}}
 
