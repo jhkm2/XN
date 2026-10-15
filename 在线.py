@@ -2,6 +2,7 @@
 import json
 import re
 import sys
+import time
 from urllib.parse import quote
 
 from base.spider import Spider as BaseSpider
@@ -12,13 +13,6 @@ sys.path.append("..")
 
 
 class Spider(BaseSpider):
-    # alist-tvbox 的 Atvp.py 兼容层的“目录化后端解析”开关（作者插件文档明确：返回网盘/磁力资源时为必填）。
-    # 置 True 后：分类/搜索结果会被包装成目录入口；详情的 vod["group"] 分组会被 Atvp 拆成
-    # “二级目录”（zxzj 一个入口、百度等网盘各一个入口，见 _detail_from_target 的组构建）：
-    #   · 点“zxzj”入口 → 本源按播放页 id 返回完整分集（见 detailContent）；
-    #   · 点“百度”入口 → Atvp 调宿主 /parse/{token} 把分享展开成真正的分集，
-    #     分集播放 id（形如 1@pid@folder@file）再由 Atvp 调 /play/{token} 换成真实播放地址。
-    # 不开这个开关：网盘线路只能透传分享链接，播放器里只会看到一个点不开的“合集”占位。
     backend_parse = True
 
     def __init__(self):
@@ -36,6 +30,9 @@ class Spider(BaseSpider):
         # 宿主 alist-tvbox 注入的地址与订阅 token（用来把网盘分享解析成分集）
         self.atv_api = ""
         self.atv_token = ""
+        # 站点详情 + 网盘分享提取结果缓存：同一剧集反复进目录/重开时免重复抓站（秒回）
+        self._detail_cache = {}
+        self._detail_cache_ttl = 900
         self.classes = [
             {"type_id": "1", "type_name": "电影"},
             {"type_id": "2", "type_name": "美剧"},
@@ -268,19 +265,6 @@ class Spider(BaseSpider):
             return self.host + raw
         return self.host + "/" + raw
 
-    def _to_relative_play_id(self, value):
-        """把站内播放地址归一成相对路径（play/xxx-1-1.html）。
-
-        Atvp 二级目录会取线路第一条的地址作为目录项 id：相对路径不会被
-        Atvp._decode_parse 当成网盘/磁力链接去调 /parse，点“zxzj”条目时
-        会回落到本源详情页（见 detailContent 对播放页 id 的处理）；
-        绝对 http 地址则会被误判成分享链接。播放时 playerContent 仍按相对路径拼回完整地址。
-        """
-        text = str(value or "").strip()
-        if text.startswith(self.host):
-            text = text[len(self.host):]
-        return re.sub(r"^/+", "", text)
-
     def _build_category_url(self, tid, pg, extend):
         values = dict(self.filter_def.get(str(tid), {"cateId": str(tid)}))
         values.update(self._normalize_ext(extend))
@@ -458,9 +442,7 @@ class Spider(BaseSpider):
             if any(keyword in tab_name for keyword in ["网盘", "百度", "夸克", "UC", "阿里", "迅雷"]):
                 pan.extend(items)
             elif items:
-                # 正常线路统一输出相对播放路径：Atvp 二级目录取第一条地址做目录项 id 时，
-                # 相对路径会走本源详情页而不是被误当分享链接（见 _to_relative_play_id）
-                normal.extend([f"{item['name']}${self._to_relative_play_id(item['play_id'])}" for item in items])
+                normal.extend([f"{item['name']}${item['play_id']}" for item in items])
         return {"normal": normal, "pan": pan}
 
     def _extract_player_payload(self, html):
@@ -675,45 +657,58 @@ class Spider(BaseSpider):
         return True
 
     def _resolve_detail_target(self, raw_id):
-        """识别 Atvp 二级目录/历史记录回传的详情目标，返回 (target, is_play_page)。
+        """把各种回传 id 归一成站点 vod_id。
 
-        - 播放页地址（play/152434-1-1.html 或其绝对地址）→ (vod_id, True)：
-          点二级目录里“zxzj”条目时回传的就是它，此时只返回站点线路详情。
-        - 详情页地址 / 纯 vod_id → (原值, False)：完整详情（含网盘线路，
-          供 Atvp 拆分二级目录、复制元数据与续播定位使用）。
+        兼容：纯数字 vod_id、/voddetail/xxx.html、历史遗留的播放页地址
+        （play/xxx-1-1.html 及其脏变体）、Atvp 目录 id 残留前缀。
         """
         text = str(raw_id or "").strip()
-        if not text:
-            return "", False
+        if text.startswith("atvp_detail:"):
+            text = text[len("atvp_detail:"):].strip()
         path = re.sub(r"^https?://[^/]+", "", text)
         matched = re.search(r"(?:^|/)play/(\d+)", path)
         if matched:
-            return matched.group(1), True
+            return matched.group(1)
         matched = re.search(r"(?:^|/)voddetail/(\d+)", path)
         if matched:
-            return matched.group(1), False
-        return text, False
+            return matched.group(1)
+        matched = re.match(r"^(\d+)$", path)
+        if matched:
+            return matched.group(1)
+        return text
 
     def detailContent(self, ids):
         raw_id = str(ids[0]).strip()
-        # Atvp 兼容：个别宿主会把目录项 id 原样带回（如 atvp_detail:152434），先剥前缀
-        if raw_id.startswith("atvp_detail:"):
-            raw_id = raw_id[len("atvp_detail:"):].strip()
-        target, is_play_page = self._resolve_detail_target(raw_id)
-        # 播放页 id 来自二级目录的“zxzj”条目：只返回站点线路详情；网盘线路留给
-        # 二级目录里的“百度/夸克”条目（由 Atvp 调宿主 /parse 展开成分集），
-        # 避免详情页里再出现点不开的网盘占位项
-        return self._detail_from_target(target, raw_id, include_pan=not is_play_page)
+        vod_id = self._resolve_detail_target(raw_id)
+        return self._detail_from_target(vod_id)
 
-    def _detail_from_target(self, target, response_id, include_pan):
-        url = target if str(target).startswith("http") else self._build_detail_url(target)
-        html = self._request_html(url, retries=3)
-        meta = self._parse_detail_meta(html)
-        playlists = self._extract_playlists(html)
-        if not playlists["normal"] and not playlists["pan"] and html:
-            # 详情页偶发返回残缺内容，再补拉一次
+    def _detail_from_target(self, vod_id):
+        """构建网盘详情：每条网盘线路 = 分享链接（合集$https://...）。
+
+        Atvp 目录模式据此生成二级目录（线路名即入口），点入口时由 Atvp 调宿主
+        /parse 展开成真分集（见类注释）。站点抓取结果带 TTL 缓存，重复进入秒回。
+        """
+        cache_key = str(vod_id or "").strip()
+        cached = self._detail_cache.get(cache_key)
+        if cached and time.time() - cached[0] < self._detail_cache_ttl:
+            meta, pan_groups = cached[1], cached[2]
+        else:
+            url = vod_id if str(vod_id).startswith("http") else self._build_detail_url(vod_id)
             html = self._request_html(url, retries=3)
+            meta = self._parse_detail_meta(html)
             playlists = self._extract_playlists(html)
+            if not playlists["pan"] and html:
+                # 详情页偶发返回残缺内容（缺网盘 tab），再补拉一次
+                html = self._request_html(url, retries=3)
+                playlists = self._extract_playlists(html)
+            pan_groups = self._extract_pan_groups(playlists["pan"])
+            if pan_groups:
+                # 只缓存成功结果：站点偶发抽风时不把空结果钉死 15 分钟
+                if len(self._detail_cache) > 60:
+                    oldest = sorted(self._detail_cache.items(), key=lambda kv: kv[1][0])[:20]
+                    for key, _ in oldest:
+                        self._detail_cache.pop(key, None)
+                self._detail_cache[cache_key] = (time.time(), meta, pan_groups)
         pan_names = {
             "baidu": "百度",
             "quark": "夸克",
@@ -728,40 +723,21 @@ class Spider(BaseSpider):
         }
         play_from = []
         play_url = []
-        # Atvp 二级目录的分组结构（backend_parse 模式读取）：
-        # 每条线路一个分组；组内 media 是"资源"——zxzj 收敛成单条"正片"（避免把整集列表
-        # 塞进目录项 id），网盘分享逐条列全。普通 TVBox 客户端忽略该字段，仍看 vod_play_from/url。
-        groups = []
-        if playlists["normal"]:
-            play_from.append("zxzj")
-            play_url.append("#".join(playlists["normal"]))
-            first_name, _, first_path = playlists["normal"][0].partition("$")
-            first_url = self._to_relative_play_id(first_path or first_name)
-            if first_url:
-                groups.append({"name": "zxzj", "media": [{"name": "正片", "url": first_url}]})
-        if include_pan:
-            for group in self._extract_pan_groups(playlists["pan"]):
-                line_name = pan_names.get(group["from"], group["from"])
-                media = []
-                for entry in str(group.get("urls") or "").split("#"):
-                    item_name, separator, item_url = entry.partition("$")
-                    item_url = str(item_url or item_name).strip()
-                    if not item_url:
-                        continue
-                    media.append({"name": (str(item_name).strip() if separator else "") or "资源", "url": item_url})
-                if media:
-                    groups.append({"name": line_name, "media": media})
-                share_url = media[0]["url"] if media else ""
-                # 形态 2（ext 含 api/token 的直接加载宿主）：本源自己把分享交给宿主
-                # /parse 展开成真分集；形态 1（Atvp 包装）拿不到 api，这里必然跳过，
-                # 由 Atvp 的 backend_parse 目录模式在用户点开网盘分组时展开
-                expanded = self._atv_parse_share(share_url, meta.get("vod_name", "")) if share_url else None
-                if expanded and self._merge_atv_lines(expanded, line_name, play_from, play_url):
-                    continue
-                play_from.append(line_name)
-                play_url.append(group["urls"])
+        for group in pan_groups:
+            line_name = pan_names.get(group["from"], group["from"])
+            first = str(group.get("urls") or "").split("#")[0]
+            _, separator, tail = first.partition("$")
+            share_url = (tail if separator else first).strip()
+            # 形态 2（ext 含 api/token 的直接加载宿主）：本源自己把分享交给宿主
+            # /parse 展开成真分集；形态 1（Atvp 包装）拿不到 api，这里必然跳过，
+            # 由 Atvp 在用户点开网盘入口时展开
+            expanded = self._atv_parse_share(share_url, meta.get("vod_name", "")) if share_url else None
+            if expanded and self._merge_atv_lines(expanded, line_name, play_from, play_url):
+                continue
+            play_from.append(line_name)
+            play_url.append(group["urls"])
         vod = {
-            "vod_id": response_id,
+            "vod_id": vod_id,
             "vod_name": meta.get("vod_name", ""),
             "vod_pic": meta.get("vod_pic", ""),
             "vod_content": meta.get("vod_content", ""),
@@ -775,10 +751,6 @@ class Spider(BaseSpider):
             "vod_play_from": "$$$".join(play_from),
             "vod_play_url": "$$$".join(play_url),
         }
-        if groups:
-            # Atvp 兼容层在 backend_parse 模式据此生成“二级目录”（vod_play_from/url 仍照旧下发，
-            # 普通客户端历史记录等场景不受影响）
-            vod["group"] = groups
         return {"list": [vod]}
 
     def _decrypt_url(self, encrypted_data):
