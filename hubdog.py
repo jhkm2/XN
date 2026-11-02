@@ -1,974 +1,881 @@
-# -*- coding: utf-8 -*-
+# coding=utf-8
 
 import base64
 import gzip
 import html as html_lib
 import json
-import os
 import re
 import ssl
+import threading
 import time
-from urllib.parse import quote, unquote, urljoin, urlparse
+import urllib.request
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
-try:  # TVBox / Atvp 运行时提供 base.spider
+try:  # TVBox 运行时提供 base.spider
     from base.spider import Spider as BaseSpider
-except Exception:  # 本地自测兜底
+except Exception:  # 本地自测 / 其他宿主兜底
     class BaseSpider(object):
         def init(self, extend=""):
             pass
 
-try:
-    import requests
-except Exception:
-    requests = None
+# 插件配置声明（alist-tvbox 网页端「订阅源 → 配置」自动渲染可视化表单；
+# 用户填写的值经 ext → data → init(extend) 原样传回，见 docs/plugin_config_schema.md）
+PLUGIN_CONFIG_SCHEMA = {
+    "description": "SeedHub（hubdog.cc）磁力/网盘源配置",
+    "allowAdditional": False,
+    "fields": [
+        {"key": "sites", "label": "站点地址", "type": "string", "required": False,
+         "aliases": ["site", "host", "url"],
+         "defaultValue": "https://hubdog.cc",
+         "placeholder": "https://hubdog.cc，多个用逗号分隔，留空用内置镜像清单"},
+        {"key": "pic_proxy", "label": "封面图代理前缀", "type": "string", "required": False,
+         "description": "封面图床（sh1.pcie.pppoe.top）走 Cloudflare，客户端网络打不开该域名时，"
+                        "填一个自己可达的图片代理前缀；留空=直连图床",
+         "placeholder": "https://images.weserv.nl/?url={url}（{url} 替换为原图地址）"},
+    ],
+}
 
-try:
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-except Exception:
-    ThreadPoolExecutor = None
+PLUGIN_ID = "seedhub-hu60d0g"
 
-import urllib.error
-import urllib.request
+SITE_NAME = "SeedHub"
+
+# 站点域名清单，主域失败自动切镜像
+# 注：sidhub/seeduck 同为 Cloudflare；104.243.25.80 为裸 IP 源站（HTTP），
+#     SNI 阻断只杀域名，裸 IP 直连在某些网络可通，作最终兜底
+DEFAULT_HOSTS = [
+    "https://hubdog.cc",
+    "https://sidhub.cc",
+    "https://seeduck.cc",
+    "http://104.243.25.80",
+]
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+
+FIXED_CLASSES = [
+    {"type_id": "rec", "type_name": "推荐"},
+    {"type_id": "mv", "type_name": "电影"},
+    {"type_id": "tv", "type_name": "电视剧"},
+    {"type_id": "ac", "type_name": "动漫"},
+]
+
+# type_id -> 站点分类目录（None 表示首页）
+CLASS_PATHS = {"mv": "1", "tv": "3", "ac": "2", "rec": None}
+
+SORT_PAIRS = [
+    ("最近更新", "update"),
+    ("近期热门", "view"),
+    ("上映时间", "date"),
+    ("豆瓣评分", "score"),
+]
+
+
+def _opts(pairs):
+    return [{"n": n, "v": v} for n, v in pairs]
+
+
+FIXED_FILTERS = {
+    "mv": [{"key": "sort", "name": "排序", "value": _opts(SORT_PAIRS)}],
+    "tv": [{"key": "sort", "name": "排序", "value": _opts(SORT_PAIRS)}],
+    "ac": [{"key": "sort", "name": "排序", "value": _opts(SORT_PAIRS)}],
+}
+
+# 网盘识别：域名片段 -> 内部键
+DISK_PATTERNS = [
+    ("quark", ("pan.quark.cn",)),
+    ("baidu", ("pan.baidu.com",)),
+    ("xunlei", ("pan.xunlei.com",)),
+    ("uc", ("drive.uc.cn", "uc.cn")),
+    ("aliyun", ("alipan.com", "aliyundrive.com", "pan.aliyun.com")),
+    ("123", ("123pan.com", "123pan.cn", "123684.com")),
+    ("115", ("115.com", "anxia.com")),
+    ("tianyi", ("cloud.189.cn", "189.cn")),
+    ("mobile", ("yun.139.com", "caiyun.139.com", "139.com")),
+]
+
+PAN_TITLES = {
+    "quark": "夸克", "baidu": "百度", "xunlei": "迅雷", "uc": "UC",
+    "aliyun": "阿里", "123": "123", "115": "115", "tianyi": "天翼",
+    "mobile": "移动", "others": "其他",
+}
+PAN_ORDER = ["quark", "baidu", "xunlei", "uc", "aliyun", "123", "115",
+             "tianyi", "mobile", "others"]
+
+MAGNET_TITLE = "磁力"
+
+# Atvp 延迟解析前缀（与 Atvp.PUSH_PREFIX 对齐）：
+# 带 prefix 的链接在二级目录/播放上下文里被剥壳，点开时回调 playerContent 换真链
+DEFERRED_PREFIX = "push://"
+
+# 站点对并发很敏感：detail 里批量解析中转页会触发限流（实测 40 并发后详情页直接取不到），
+# 所以 detail 只产出中转链接，真正的解析放到 playerContent 点播时按需做（带缓存）。
+PAGE_SIZE = 20
+MAX_SEEDS = 120
+MAX_PANS = 160
+
+# 列表页（首页/分类/搜索）TTL 缓存：设备到站点（Cloudflare）链路偏慢时，
+# 重进分类/翻回已看过的页直接秒出
+PAGE_CACHE_TTL = 300
+PAGE_CACHE_MAX = 64
+
+# Cloudflare 人机验证页特征（盾页会被当成“成功抓到”导致解析为空，必须识别后走容灾）
+CHALLENGE_MARKERS = ("just a moment", "cf-browser-verification", "challenge-platform",
+                     "cf_chl_", "_cf_chl", "attention required", "checking your browser",
+                     "enable javascript and cookies")
+CHALLENGE_HEAD = 6000
+
+# curl_cffi（可选依赖）：以真实 Chrome TLS 指纹发请求。
+# 服务端(T4)执行时，容器的 Python/OpenSSL 指纹会被 Cloudflare 盯上（人机验证页），
+# 换代理节点无效；装上 curl_cffi 后按 Chrome 指纹直连即可过盾：
+#   docker exec alist-tvbox sh -c "apk add --no-cache py3-pip \
+#     && python3 -m pip install --break-system-packages curl-cffi"
+# 未安装时自动退回普通 requests（客户端执行不受影响）。
+try:
+    from curl_cffi import requests as _cffi_requests
+except Exception:
+    _cffi_requests = None
+
+# FlareSolverr 解盾结果缓存（解一次 5~20s，必须复用）
+FS_CACHE_TTL = 600
+FS_CACHE_MAX = 64
+FS_MAX_TIMEOUT = 25000  # T4 单次调用死线 30s，解盾超时留余量
 
 
 class Spider(BaseSpider):
-
-    # ------------------------------------------------------------------ 配置
-    site_name = "SeedHub"
-
-    # ★ T4/alist-tvbox 必填：网盘线路交给后端挂载解析
-    backend_parse = True
-
-    # ★ 改动 6：本站对直连出口做 TCP RST，必须走代理才能拿到页面
-    #   填局域网 HTTP 代理；置空则只直连。也可用环境变量 HUBDOG_PROXY 覆盖。
-    PROXY = os.environ.get("HUBDOG_PROXY", "http://10.30.31.75:7890")
-
-    # 磁力线路在 TVBox 客户端播不了，默认不输出
-    ENABLE_MAGNET_LINES = False
-
-    # 网盘链接预解析的并发/超时/上限（detail 会因此变慢，别调太大）
-    PAN_RESOLVE_WORKERS = 10
-    PAN_RESOLVE_TIMEOUT = 3
-    PAN_RESOLVE_MAX = 24
-    PAN_RESOLVE_DEADLINE = 6.0  # 预解析总预算(秒)，超时就少给几条，别把详情拖到超时
-    PAN_PER_GROUP_MAX = 4      # 每种网盘只解析前 N 条，控制 detail 耗时
-    PAN_CACHE_TTL = 6 * 3600
-
-    # 主域名 + 镜像，前一个不可用时自动切换
-    base_hosts = ("https://hubdog.cc", "https://sidhub.cc")
-
-    UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-
-    HEADERS = {
-        "User-Agent": UA,
-        "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
-                   "image/avif,image/webp,*/*;q=0.8"),
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-    }
-
-    ORDERS = (
-        ("update", "最近更新"),
-        ("view", "近期热门"),
-        ("date", "上映时间"),
-        ("score", "豆瓣评分"),
-    )
-
-    # ★ 本站真实分类（页面上只有 /categories/1|2|3/movies/）
-    REAL_CATEGORIES = (("1", "电影"), ("2", "动漫"), ("3", "剧集"))
-    TID_ALIASES = {
-        "": "", "rec": "", "recommend": "", "home": "",
-        "1": "1", "mv": "1", "movie": "1", "film": "1", "dy": "1", "电影": "1",
-        "2": "2", "ac": "2", "anime": "2", "dongman": "2", "动漫": "2",
-        "3": "3", "tv": "3", "tvshow": "3", "series": "3", "剧集": "3", "电视剧": "3",
-    }
-
-    PAN_NAMES = {
-        "pan.baidu.com": "百度网盘",
-        "pan.quark.cn": "夸克网盘",
-        "drive.uc.cn": "UC网盘",
-        "pan.xunlei.com": "迅雷网盘",
-        "alipan.com": "阿里云盘",
-        "aliyundrive.com": "阿里云盘",
-        "www.aliyundrive.com": "阿里云盘",
-        "drive.115.com": "115网盘",
-        "115.com": "115网盘",
-        "caiyun.139.com": "移动云盘",
-        "cloud.189.cn": "天翼云盘",
-        "pan.123pan.com": "123网盘",
-    }
-
-    MEDIA_RE = re.compile(
-        r"\.(?:m3u8|mp4|flv|mkv|avi|ts|mov|webm|m4v)(?:$|[?#])", re.I)
-
-    PAGE_SIZE = 20
-    MAX_SEEDS = 100
-    MAX_PANS = 120
-
-    # ------------------------------------------------------------------ 生命周期
     def __init__(self):
-        self.base = self.base_hosts[0]
-        self._sess = None
+        self.name = "%s[盘]" % SITE_NAME
+        self.hosts = [self._normalize_host(site)[0] for site in DEFAULT_HOSTS]
+        self.host = ""
+        self.referer = ""
+        # 关键：告诉宿主“网盘/磁力链接由你解析”，插件只诚实回链
+        self.backend_parse = True
+        self.headers = {"User-Agent": UA, "Accept": ACCEPT}
+        self.pic_proxy = ""
+        self._lock = threading.RLock()
+        self._item_cache = {}
+        self._link_cache = {}
+        self._detail_cache = {}
+        self._page_cache = {}
         self._home_cache = ("", 0.0)
-        self._sidebar_cache = (None, 0.0)
-        self._pan_cache = {}
-
-    def getName(self):
-        return self.site_name
+        self._activate_host(self.hosts[0])
 
     def init(self, extend=""):
-        """extend 可能是 JSON 字符串（Atvp 传 {"token":...}）或自定义域名"""
-        self.extend = extend
-        try:
-            if extend:
-                host = ""
-                ext = extend if isinstance(extend, str) else str(extend)
-                ext = ext.strip()
-                if ext.startswith("{"):
-                    try:
-                        host = str(json.loads(ext).get("site") or "").strip()
-                    except Exception:
-                        host = ""
-                elif ext.startswith("http"):
-                    host = ext
-                if host:
-                    self.base = host.rstrip("/")
-                    if self.base not in self.base_hosts:
-                        self.base_hosts = (self.base,) + self.base_hosts
-        except Exception:
-            pass
-        self._sess = None
-        return self
+        cfg = self._parse_extend(extend)
+        sites = self._parse_sites(cfg.get("site") or cfg.get("sites") or cfg.get("url"))
+        self.hosts = sites or [self._normalize_host(site)[0] for site in DEFAULT_HOSTS]
+        self._activate_host(self.hosts[0])
+        self.pic_proxy = str(cfg.get("pic_proxy") or "").strip()
+        with self._lock:
+            self._item_cache.clear()
+            self._link_cache.clear()
+            self._detail_cache.clear()
+            self._page_cache.clear()
+            self._home_cache = ("", 0.0)
+        return None
 
-    def destroy(self):
-        try:
-            if self._sess is not None:
-                self._sess.close()
-        except Exception:
-            pass
-        self._sess = None
+    def getName(self):
+        return self.name
 
-    # ------------------------------------------------------------------ HTTP
-    def _session(self):
-        if self._sess is None and requests is not None:
-            s = requests.Session()
-            s.headers.update(self.HEADERS)
+    def danmaku(self):
+        # 站点不提供弹幕
+        return False
+
+    # ---- config / host utils ----
+    def _parse_extend(self, extend):
+        """兼容四种形态：dict / JSON 字符串 / base64(JSON) / 裸站点 URL。
+
+        Atvp 形态 1（.py 插件经包装层加载）传 {"token", "local_proxy_config",
+        <插件自定义字段原样合并在顶层>}；形态 2（旧宿主直载）可能带 api/token。
+        本插件只消费 sites/site/host/url，其余字段忽略即可。
+        """
+        if isinstance(extend, dict):
+            return extend
+        text = str(extend or "").strip()
+        if not text:
+            return {}
+        try:
+            data = json.loads(text)
+        except Exception:
+            # 兼容 base64(JSON) 形态的 ext
             try:
-                from requests.adapters import HTTPAdapter
-                s.mount("https://", HTTPAdapter(max_retries=1))
-                s.mount("http://", HTTPAdapter(max_retries=1))
+                padded = text + "=" * (-len(text) % 4)
+                data = json.loads(base64.b64decode(padded).decode("utf-8", "ignore"))
+            except Exception:
+                data = None
+            if isinstance(data, dict):
+                return data
+            # 兼容直接传站点的写法：init("https://sidhub.cc")
+            if re.match(r"(?i)^https?://", text):
+                return {"site": text}
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _normalize_host(self, value):
+        host = str(value or "").strip().rstrip("/")
+        if not host:
+            host = DEFAULT_HOSTS[0]
+        if not re.match(r"(?i)^https?://", host):
+            host = "https://" + host
+        parsed = urlsplit(host)
+        hostname = parsed.hostname or ""
+        try:
+            ascii_host = hostname.encode("idna").decode("ascii")
+        except Exception:
+            ascii_host = hostname
+        netloc = ascii_host
+        if parsed.port:
+            netloc += ":%d" % parsed.port
+        normalized = urlunsplit((parsed.scheme or "https", netloc,
+                                 parsed.path.rstrip("/"), "", ""))
+        referer = urlunsplit((parsed.scheme or "https", netloc, "", "", ""))
+        return normalized, referer
+
+    def _parse_sites(self, value):
+        if isinstance(value, (list, tuple)):
+            raw_sites = value
+        else:
+            raw_sites = re.split(r"[\s,，|]+", str(value or "").strip())
+        sites = []
+        for raw in raw_sites:
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            normalized, _ = self._normalize_host(text)
+            if normalized and normalized not in sites:
+                sites.append(normalized)
+        return sites
+
+    def _activate_host(self, host):
+        normalized, referer = self._normalize_host(host)
+        self.host = normalized
+        self.referer = referer or normalized
+        self.headers["Referer"] = self.referer + "/"
+
+    def _ordered_hosts(self):
+        return [self.host] + [h for h in self.hosts if h != self.host]
+
+    def _cover_url(self, pic):
+        """封面改写：配置了 pic_proxy 时经图代中转（图床 sh1.pcie.pppoe.top 走
+        Cloudflare，部分客户端网络 DNS/SNI 层打不开该域名，直连会全灰）"""
+        pic = str(pic or "").strip()
+        if not pic or not self.pic_proxy:
+            return pic
+        proxy = self.pic_proxy
+        if "{url}" in proxy:
+            return proxy.replace("{url}", quote(pic, safe=""))
+        return proxy + quote(pic, safe="")
+
+    def _cached_page(self, path, fetcher, timeout=12):
+        """列表页 TTL 缓存：只缓存成功结果，重进分类/翻页不重复抓站"""
+        with self._lock:
+            hit = self._page_cache.get(path)
+        if hit and time.time() - hit[1] < PAGE_CACHE_TTL:
+            return hit[0]
+        html = fetcher(path, timeout)
+        if html:
+            with self._lock:
+                if len(self._page_cache) >= PAGE_CACHE_MAX and path not in self._page_cache:
+                    self._page_cache.pop(next(iter(self._page_cache)))
+                self._page_cache[path] = (html, time.time())
+        return html
+
+    # ---- http ----
+    def _build_headers(self, extra=None):
+        headers = dict(self.headers)
+        if extra:
+            headers.update(extra)
+        return headers
+
+    def _request_text(self, url, extra_headers=None, timeout=12):
+        """抓取入口：盾页一律按失败处理（返回空 → 触发镜像容灾），不把验证页当内容"""
+        text = self._request_text_raw(url, extra_headers, timeout)
+        if text and self._looks_like_challenge(text):
+            return ""
+        return text
+
+    def _looks_like_challenge(self, html):
+        if not html:
+            return False
+        head = html[:CHALLENGE_HEAD].lower()
+        return any(marker in head for marker in CHALLENGE_MARKERS)
+
+    def _request_text_raw(self, url, extra_headers=None, timeout=12):
+        """优先用宿主给的 fetch（与观影.py 一致），缺失时退回 curl_cffi / requests / urllib"""
+        headers = self._build_headers(extra_headers)
+        fetcher = getattr(self, "fetch", None)
+        if callable(fetcher):
+            try:
+                resp = fetcher(url, headers=headers, timeout=timeout,
+                               verify=False, allow_redirects=True)
+                status = int(getattr(resp, "status_code", 200) or 200)
+                if status < 400:
+                    return str(getattr(resp, "text", "") or "")
+                if status in (403, 404, 410):
+                    return ""
             except Exception:
                 pass
-            self._sess = s
-        return self._sess
+
+        # curl_cffi：真实 Chrome TLS 指纹（服务端执行被 CF 盾时的解法，可选依赖）
+        if _cffi_requests is not None:
+            try:
+                r = _cffi_requests.get(url, headers=headers, timeout=timeout,
+                                       impersonate="chrome", verify=False)
+                status = int(getattr(r, "status_code", 0) or 0)
+                if status < 400:
+                    return self._decode(r.content, "")
+                if status in (403, 404, 410):
+                    return ""
+            except Exception:
+                pass
+
+        try:
+            import requests
+            r = requests.get(url, headers=headers, timeout=timeout, verify=False)
+            if r.status_code < 400:
+                return self._decode(r.content, r.headers.get("Content-Type", ""))
+            return ""
+        except Exception:
+            pass
+
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                raw = resp.read()
+                ce = (resp.headers.get("Content-Encoding") or "").lower()
+                try:
+                    if "gzip" in ce:
+                        raw = gzip.decompress(raw)
+                    elif "deflate" in ce:
+                        import zlib
+                        raw = zlib.decompress(raw, -zlib.MAX_WBITS)
+                except Exception:
+                    pass
+                return self._decode(raw, resp.headers.get("Content-Type", ""))
+        except Exception:
+            return ""
 
     def _decode(self, raw, content_type=""):
         if not raw:
             return ""
         enc = ""
-        m = re.search(r"charset=[\"']?([\w\-]+)", content_type or "", re.I)
-        if m:
-            enc = m.group(1)
+        match = re.search(r"charset=[\"']?([\w\-]+)", content_type or "", re.I)
+        if match:
+            enc = match.group(1)
         if not enc:
-            m = re.search(rb"<meta[^>]+charset=[\"']?([\w\-]+)", raw[:2048], re.I)
-            if m:
-                enc = m.group(1).decode("ascii", "ignore")
-        for e in (enc, "utf-8", "gb18030"):
-            if not e:
+            match = re.search(rb"<meta[^>]+charset=[\"']?([\w\-]+)", raw[:2048], re.I)
+            if match:
+                enc = match.group(1).decode("ascii", "ignore")
+        for item in (enc, "utf-8", "gb18030"):
+            if not item:
                 continue
             try:
-                return raw.decode(e)
+                return raw.decode(item)
             except Exception:
                 continue
         return raw.decode("utf-8", "ignore")
 
-    def _http(self, url, referer=None, timeout=12, retries=1):
-        """★ 改动 6：先走 PROXY，失败再直连兜底（本站直连必被 RST）"""
-        headers = dict(self.HEADERS)
-        if referer:
-            headers["Referer"] = referer
-        text = ""
-        if self.PROXY:
-            text = self._request(url, headers, timeout, retries, self.PROXY)
-        if not text:
-            text = self._request(url, headers, timeout, retries, None)
-        return text
-
-    def _request(self, url, headers, timeout, retries, proxy):
-        for _ in range(retries + 1):
-            try:
-                if requests is not None:
-                    sess = self._session()
-                    kw = {"headers": headers, "timeout": timeout, "allow_redirects": True}
-                    if proxy:
-                        kw["proxies"] = {"http": proxy, "https": proxy}
-                    try:
-                        r = sess.get(url, verify=True, **kw)
-                    except Exception as e:
-                        if "SSL" in type(e).__name__.upper() or "SSL" in str(e).upper():
-                            try:
-                                import urllib3
-                                urllib3.disable_warnings()
-                            except Exception:
-                                pass
-                            r = sess.get(url, verify=False, **kw)
-                        else:
-                            raise
-                    if r.status_code >= 400:
-                        if r.status_code in (403, 404, 410):
-                            return ""
-                        continue
-                    return self._decode(r.content,
-                                        r.headers.get("Content-Type", ""))
-                handlers = []
-                if proxy:
-                    handlers.append(urllib.request.ProxyHandler(
-                        {"http": proxy, "https": proxy}))
-                else:
-                    handlers.append(urllib.request.ProxyHandler({}))
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                handlers.append(urllib.request.HTTPSHandler(context=ctx))
-                opener = urllib.request.build_opener(*handlers)
-                req = urllib.request.Request(url, headers=headers)
-                with opener.open(req, timeout=timeout) as resp:
-                    raw = resp.read()
-                    ce = (resp.headers.get("Content-Encoding") or "").lower()
-                    try:
-                        if "gzip" in ce:
-                            raw = gzip.decompress(raw)
-                        elif "deflate" in ce:
-                            import zlib
-                            raw = zlib.decompress(raw, -zlib.MAX_WBITS)
-                    except Exception:
-                        pass
-                    return self._decode(raw, resp.headers.get("Content-Type", ""))
-            except Exception:
-                time.sleep(0.15)
-        return ""
-
-    def _abs(self, path):
+    def _absolute(self, path):
         if not path:
-            return self.base + "/"
+            return self.host + "/"
         if path.startswith("//"):
             return "https:" + path
-        if path.startswith("http"):
+        if re.match(r"(?i)^https?://", path):
             return path
-        if not path.startswith("/"):
-            path = "/" + path
-        return self.base + path
+        return urljoin(self.host + "/", str(path).lstrip("/"))
 
     def _fetch(self, path, referer=None, timeout=12):
-        url = self._abs(path)
-        try:
-            host = "{0.scheme}://{0.netloc}".format(urlparse(url))
-        except Exception:
-            host = self.base
-
-        text = self._http(url, referer or (self.base + "/"), timeout=timeout)
+        """站内页面抓取：主域失败按 _ordered_hosts 依次切镜像"""
+        url = self._absolute(path)
+        text = self._request_text(url, {"Referer": referer or (self.referer + "/")}, timeout)
         if text:
             return text
-
-        if host in self.base_hosts:
-            u = urlparse(url)
-            tail = u.path + (("?" + u.query) if u.query else "")
-            for alt_host in self.base_hosts:
-                if alt_host == host:
-                    continue
-                t = self._http(alt_host + tail, referer or (alt_host + "/"),
-                               timeout=timeout)
-                if t:
-                    self.base = alt_host
-                    return t
+        parsed = urlsplit(url)
+        origin = "%s://%s" % (parsed.scheme, parsed.netloc)
+        if origin not in self.hosts:
+            return ""
+        tail = parsed.path + (("?" + parsed.query) if parsed.query else "")
+        for host in self._ordered_hosts():
+            if host == origin:
+                continue
+            alt = host + tail
+            text = self._request_text(alt, {"Referer": host + "/"}, timeout)
+            if text:
+                self._activate_host(host)
+                return text
         return ""
 
-    # ------------------------------------------------------------------ HTML 工具
+    # ---- html utils ----
     def _text(self, frag):
         if not frag:
             return ""
-        s = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", frag)
-        s = re.sub(r"(?is)<br\s*/?>", "\n", s)
-        s = re.sub(r"(?is)</(p|li|div|h\d)>", "\n", s)
-        s = re.sub(r"(?s)<[^>]+>", "", s)
-        s = html_lib.unescape(s)
-        s = s.replace("\u00a0", " ").replace("\u3000", " ")
-        s = re.sub(r"[ \t\r\f\v]+", " ", s)
-        s = re.sub(r"\n\s*\n+", "\n", s)
-        return s.strip()
+        value = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", frag)
+        value = re.sub(r"(?is)<br\s*/?>", "\n", value)
+        value = re.sub(r"(?s)<[^>]+>", "", value)
+        value = html_lib.unescape(value).replace("\u00a0", " ").replace("\u3000", " ")
+        value = re.sub(r"[ \t\r\f\v]+", " ", value)
+        return re.sub(r"\n\s*\n+", "\n", value).strip()
 
     def _attr(self, tag, name):
-        m = re.search(r'%s\s*=\s*"([^"]*)"' % re.escape(name), tag or "", re.I)
-        if not m:
-            m = re.search(r"%s\s*=\s*'([^']*)'" % re.escape(name), tag or "", re.I)
-        return html_lib.unescape(m.group(1)) if m else ""
+        match = re.search(r'%s\s*=\s*"([^"]*)"' % re.escape(name), tag or "", re.I)
+        return html_lib.unescape(match.group(1)) if match else ""
 
-    def _esc(self, s):
-        return (s or "").replace("$", "＄").replace("#", "＃").replace("\n", " ").strip()
+    # ---- item cache ----
+    def _remember_items(self, items):
+        with self._lock:
+            for item in items:
+                vod_id = str(item.get("vod_id") or "").strip()
+                title = str(item.get("vod_name") or "").strip()
+                if not vod_id or not title or title == vod_id:
+                    continue
+                if len(self._item_cache) >= 512 and vod_id not in self._item_cache:
+                    self._item_cache.pop(next(iter(self._item_cache)))
+                self._item_cache[vod_id] = {
+                    "vod_name": title,
+                    "vod_pic": str(item.get("vod_pic") or "").strip(),
+                    "vod_year": str(item.get("vod_year") or "").strip(),
+                    "vod_remarks": str(item.get("vod_remarks") or "").strip(),
+                }
+        return items
 
-    # ------------------------------------------------------------------ 列表解析
-    def _parse_covers(self, page):
-        out = []
+    def _cached_item(self, vod_id):
+        with self._lock:
+            return dict(self._item_cache.get(vod_id) or {})
+
+    # ---- list parsers ----
+    def _parse_covers(self, html):
+        items = []
+        page = str(html or "")
         if not page:
-            return out
+            return items
         start = page.find('<div class="cover-container">')
         if start > 0:
             page = page[start:]
-        blocks = page.split('<div class="cover">')[1:]
         seen = set()
-        for blk in blocks:
-            blk = blk.split("</ul>")[0]
-            m = re.search(r'href="(/movies/(\d+)/)"', blk)
-            if not m:
+        for block in page.split('<div class="cover">')[1:]:
+            block = block.split("</ul>")[0]
+            match = re.search(r'href="(/movies/(\d+)/)"', block)
+            if not match:
                 continue
-            vid = m.group(2)
-            if vid in seen:
+            rid = match.group(2)
+            if rid in seen:
                 continue
-            seen.add(vid)
+            seen.add(rid)
 
-            name = ""
-            h2 = re.search(r"</a>\s*([^<]+?)\s*</h2>", blk, re.S)
-            if h2:
-                name = html_lib.unescape(h2.group(1)).strip()
-            if not name:
-                img_tag = re.search(r"<img[^>]*>", blk)
-                if img_tag:
-                    name = self._attr(img_tag.group(0), "alt")
-            if not name:
+            title = ""
+            heading = re.search(r"</a>\s*([^<]+?)\s*</h2>", block, re.S)
+            if heading:
+                title = html_lib.unescape(heading.group(1)).strip()
+            img_tag = re.search(r"<img[^>]*>", block)
+            if not title and img_tag:
+                title = self._attr(img_tag.group(0), "alt")
+            if not title:
                 continue
 
-            pic = ""
-            img_tag = re.search(r"<img[^>]*>", blk)
-            if img_tag:
-                pic = self._attr(img_tag.group(0), "src")
-            if pic.startswith("//"):
-                pic = "https:" + pic
+            cover = self._attr(img_tag.group(0), "src") if img_tag else ""
+            if cover.startswith("//"):
+                cover = "https:" + cover
 
-            year = area = lang = actor = ""
-            meta_line = re.search(r"</h2></li>\s*<li>(.*?)</li>", blk, re.S)
-            if meta_line:
-                raw = self._text(meta_line.group(1))
-                parts = [p.strip() for p in raw.split("/")]
+            year = area = actor = score = ""
+            meta = re.search(r"</h2></li>\s*<li>(.*?)</li>", block, re.S)
+            if meta:
+                parts = [p.strip() for p in self._text(meta.group(1)).split("/")]
                 if len(parts) >= 4:
-                    year, area, lang = parts[0], parts[2], parts[3]
+                    year, area = parts[0], parts[2]
                     actor = " / ".join(parts[4:]).strip(" /")
-                elif len(parts) == 3:
-                    year, area, lang = parts[0], parts[1], parts[2]
                 elif parts:
                     year = parts[0]
+            score_match = re.search(r"豆瓣评分:\s*<a[^>]*>(.*?)</a>", block, re.S)
+            if score_match:
+                score = self._text(score_match.group(1))
 
-            types = []
-            tm = re.search(r"类型:\s*(.*?)</li>", blk, re.S)
-            if tm:
-                types = [html_lib.unescape(t) for t in
-                         re.findall(r'title="([^"]+)"', tm.group(1))]
-                if not types:
-                    types = [self._text(tm.group(1))]
-
-            score = ""
-            sm = re.search(r"豆瓣评分:\s*<a[^>]*>(.*?)</a>", blk, re.S)
-            if sm:
-                score = self._text(sm.group(1))
-
-            remarks = []
-            if score and score not in ("0", "0.0"):
-                remarks.append("豆瓣%s" % score)
-            if types:
-                remarks.append(types[0])
-
-            out.append({
-                "vod_id": vid,
-                "vod_name": name,
-                "vod_pic": pic,
+            items.append({
+                "vod_id": "sd_%s" % rid,
+                "vod_name": title,
+                "vod_pic": self._cover_url(cover),
                 "vod_year": year,
                 "vod_area": area,
-                "vod_lang": lang,
                 "vod_actor": actor,
-                "vod_remarks": " · ".join(remarks),
+                "vod_remarks": "%s / 豆瓣 %s" % (year or "—", score or "0"),
             })
-        return out
+        return self._remember_items(items)
 
-    def _parse_pagecount(self, page, pg):
-        try:
-            nums = [int(x) for x in re.findall(r'\?page=(\d+)', page or "")]
-        except Exception:
-            nums = []
-        return max(nums) if nums else max(1, int(pg))
-
-    # ------------------------------------------------------------------ 首页
-    def _home_html(self):
-        html, ts = self._home_cache
-        if html and time.time() - ts < 600:
-            return html
-        html = self._fetch("/")
-        if html:
-            self._home_cache = (html, time.time())
-        return html
-
-    def _sidebar(self):
-        cats, types = self._sidebar_cache[0] or ([], {})
-        if cats:
-            return cats, types
-        page = self._home_html()
+    def _parse_detail_page(self, html):
+        detail = {"name": "", "pic": "", "meta": {}, "desc": "",
+                  "seeds": [], "pans": []}
+        page = str(html or "")
         if not page:
-            return [], {}
-        start = page.find('<ul class="sidebar-links">')
-        if start < 0:
-            return [], {}
-        end = page.find('<div class="page"', start)
-        seg = page[start:end if end > 0 else len(page)]
-        chunks = re.split(r'<p class="sidebar-heading', seg)[1:]
-        for ch in chunks:
-            m = re.search(r'href="/categories/(\d+)/movies/"[^>]*>([^<]+)</a>', ch)
-            if not m:
-                continue
-            cid = m.group(1)
-            cname = html_lib.unescape(m.group(2)).strip()
-            tlist = [(t, html_lib.unescape(n).strip()) for t, n in
-                     re.findall(r'href="/categories/\d+/types/(\d+)/movies/"[^>]*>([^<]+)</a>', ch)]
-            if cid not in [c[0] for c in cats]:
-                cats.append((cid, cname))
-            if tlist:
-                types[cid] = tlist
-        if cats:
-            self._sidebar_cache = ((cats, types), time.time())
-        return cats, types
+            return detail
 
-    def homeContent(self, filter=True):
-        """★ 改动 2：带上 list，否则 T4 首页是空白（T4 只调 homeContent）"""
-        try:
-            cats, types = self._sidebar()
-            if not cats:
-                cats = list(self.REAL_CATEGORIES)
-            classes = [{"type_id": cid, "type_name": cname} for cid, cname in cats]
-
-            order_values = [{"n": n, "v": v} for v, n in self.ORDERS]
-            filters = {}
-            for cid, _ in cats:
-                value = [{"n": "全部", "v": ""}]
-                value += [{"n": n, "v": t} for t, n in types.get(cid, [])]
-                filters[cid] = [
-                    {"key": "类型", "name": "类型", "value": value},
-                    {"key": "排序", "name": "排序", "value": order_values},
-                ]
-            return {
-                "class": classes,
-                "filters": filters,
-                "list": self._parse_covers(self._home_html()),
-            }
-        except Exception:
-            return {"class": [{"type_id": cid, "type_name": cname}
-                              for cid, cname in self.REAL_CATEGORIES],
-                    "filters": {}, "list": []}
-
-    def homeVideoContent(self):
-        try:
-            return {"list": self._parse_covers(self._home_html())}
-        except Exception:
-            return {"list": []}
-
-    # ------------------------------------------------------------------ 分类
-    def _norm_tid(self, tid):
-        """★ 改动 3：数字 / slug(rec,mv,tv,ac) / atvp_detail:xxx / 整条路径 → 真实分类 id"""
-        t = str(tid or "").strip()
-        for pre in ("atvp_detail:", "atvp_group:", "atvp_resume:"):
-            if t.startswith(pre):
-                t = t[len(pre):]
-        m = re.search(r"/categories/(\d+)/", t)
-        if m:
-            return m.group(1)
-        low = t.lower()
-        if low in self.TID_ALIASES:
-            return self.TID_ALIASES[low]
-        m = re.search(r"\d+", t)
-        return m.group(0) if m else ""
-
-    def categoryContent(self, tid, pg, filter=True, extend=None):
-        tid_raw = str(tid or "").strip()
-        try:
-            page_no = max(1, int(str(pg or "1").strip() or 1))
-        except Exception:
-            page_no = 1
-
-        ext = {}
-        if isinstance(extend, dict):
-            ext = extend
-        elif isinstance(extend, str) and extend.strip().startswith("{"):
-            try:
-                ext = json.loads(extend)
-            except Exception:
-                ext = {}
-
-        tid = self._norm_tid(tid_raw)
-        type_id = str(ext.get("类型", "") or "").strip()
-        order = str(ext.get("排序", "update") or "update").strip()
-        if order not in [v for v, _ in self.ORDERS]:
-            order = "update"
-        if not type_id.isdigit():
-            type_id = ""
-
-        # 「推荐」类 tid（rec/空）：直接用首页列表，避免拼出 404 路径
-        if not tid:
-            items = self._parse_covers(self._home_html()) if page_no == 1 else []
-            return {"list": items, "page": page_no,
-                    "pagecount": 1 if page_no == 1 else page_no,
-                    "limit": self.PAGE_SIZE, "total": len(items)}
-
-        if type_id:
-            path = "/categories/%s/types/%s/movies/?page=%d&order=%s" % (
-                tid, type_id, page_no, order)
-        else:
-            path = "/categories/%s/movies/?page=%d&order=%s" % (tid, page_no, order)
-
-        page = self._fetch(path, referer=self.base + "/")
-        if not page:
-            return {"list": [], "page": page_no, "pagecount": page_no,
-                    "limit": self.PAGE_SIZE, "total": 0}
-
-        items = self._parse_covers(page)
-        pagecount = self._parse_pagecount(page, page_no)
-        if pagecount < page_no:
-            pagecount = page_no
-        total = pagecount * self.PAGE_SIZE if items else 0
-        return {
-            "list": items,
-            "page": page_no,
-            "pagecount": pagecount,
-            "limit": self.PAGE_SIZE,
-            "total": total,
-        }
-
-    # ------------------------------------------------------------------ 详情
-    def _clean_pan_title(self, title, limit=42):
-        t = (title or "").strip()
-        t = re.sub(r"\s*更新于.*$", "", t)
-        t = re.sub(r"[\s　]*(刚刚|今天|昨天|前天|\d+\s*(?:秒|分钟|小时|天|周|月)前)\s*$",
-                   "", t)
-        t = re.sub(r"\s*提取码[:：].*$", "", t)
-        t = re.sub(r"[ \t\u3000]{2,}", " ", t).strip(" -_|·")
-        if len(t) > limit:
-            t = t[:limit].rstrip() + "…"
-        return t or "资源"
-
-    def _parse_seeds(self, page):
-        out = []
-        m = re.search(r'<ul class="seeds"[^>]*>(.*?)</ul>', page or "", re.S)
-        if not m:
-            return out
-        for li in re.findall(r"<li>(.*?)</li>", m.group(1), re.S):
-            hm = re.search(r'href="[^"]*seed_id=(\d+)', li)
-            if not hm:
-                continue
-            seed_id = hm.group(1)
-            title_tag = re.search(r"<a[^>]*>", li)
-            title = self._attr(title_tag.group(0), "title") if title_tag else ""
-            size = ""
-            sm = re.search(r'class="size"[^>]*>([^<]*)<', li)
-            if sm:
-                size = html_lib.unescape(sm.group(1)).strip()
-            feats = [html_lib.unescape(f).strip() for f in
-                     re.findall(r'class="seed-feature"[^>]*>([^<]*)<', li)]
-            ctime = ""
-            cm = re.search(r'class="create-time"[^>]*>([^<]*)<', li)
-            if cm:
-                ctime = cm.group(1).strip()
-            out.append({
-                "seed_id": seed_id,
-                "title": title,
-                "size": size,
-                "features": [f for f in feats if f],
-                "time": ctime,
-                "url": self._abs("/link_start/?seed_id=%s" % seed_id),
-            })
-            if len(out) >= self.MAX_SEEDS:
-                break
-        return out
-
-    def _parse_pans(self, page):
-        out = []
-        m = re.search(r'<ul class="pan-links"[^>]*>(.*?)</ul>', page or "", re.S)
-        if not m:
-            return out
-        for li in re.findall(r"<li>(.*?)</li>", m.group(1), re.S):
-            tag_m = re.search(r"<a[^>]*>", li)
-            if not tag_m:
-                continue
-            tag = tag_m.group(0)
-            href = self._attr(tag, "href")
-            pid = ""
-            pm = re.search(r"redirect_to=(pan_id_\d+)", href)
-            if pm:
-                pid = pm.group(1)
-            if not pid:
-                continue
-            host = self._attr(tag, "data-link").lower()
-            title = self._attr(tag, "title") or self._text(li)
-            title = re.sub(r"\s*更新于.*$", "", title).strip()
-            out.append({
-                "pan_id": pid,
-                "host": host,
-                "title": title,
-                "url": self._abs("/link_start/?redirect_to=%s" % pid),
-            })
-            if len(out) >= self.MAX_PANS:
-                break
-        return out
-
-    def _parse_detail(self, page, vid):
-        d = {"vod_id": vid, "name": "", "pic": "", "meta": {}, "desc": "",
-             "seeds": [], "pans": []}
-        if not page:
-            return d
-
-        m = re.search(r'<h1 id="cover">(.*?)</h1>', page, re.S)
-        if m:
-            d["name"] = self._text(m.group(1)).lstrip("#").strip()
-
-        m = re.search(r'<div class="cover-container">\s*<img[^>]*>', page)
-        if m:
-            d["pic"] = self._attr(m.group(0), "src")
-            if d["pic"].startswith("//"):
-                d["pic"] = "https:" + d["pic"]
+        match = re.search(r'<h1 id="cover">(.*?)</h1>', page, re.S)
+        if match:
+            detail["name"] = self._text(match.group(1)).lstrip("#").strip()
+        match = re.search(r'<div class="cover-container">\s*<img[^>]*>', page)
+        if match:
+            detail["pic"] = self._cover_url(self._attr(match.group(0), "src"))
+            if detail["pic"].startswith("//"):
+                detail["pic"] = "https:" + detail["pic"]
 
         start = page.find('<div class="cover-container">')
         if start > 0:
             end = page.find("</ul>", start)
             block = page[start:end if end > 0 else start + 6000]
-            for li in re.findall(r"<li>(.*?)</li>", block, re.S):
-                txt = self._text(li)
-                if not txt:
-                    continue
-                parts = re.split(r"[:：]", txt, 1)
+            for row in re.findall(r"<li>(.*?)</li>", block, re.S):
+                text = self._text(row)
+                parts = re.split(r"[:：]", text, 1)
                 if len(parts) == 2:
-                    k = parts[0].strip()
-                    v = parts[1].strip()
-                    if k and k not in d["meta"]:
-                        d["meta"][k] = v
+                    key = parts[0].strip()
+                    if key and key not in detail["meta"]:
+                        detail["meta"][key] = parts[1].strip()
 
-        m = re.search(r'<h2 id="description">.*?</h2>\s*<p>(.*?)</p>', page, re.S)
-        if m:
-            d["desc"] = self._text(m.group(1))
+        match = re.search(r'<h2 id="description">.*?</h2>\s*<p>(.*?)</p>', page, re.S)
+        if match:
+            detail["desc"] = self._text(match.group(1))
 
-        d["seeds"] = self._parse_seeds(page)
-        d["pans"] = self._parse_pans(page)
-        return d
-
-    def _pan_share(self, pan):
-        """★ 改动 4：把 /link_start/?redirect_to=pan_id_N 换成真实分享链接（带缓存）"""
-        pid = pan.get("pan_id") or ""
-        if not pid:
-            return ""
-        hit = self._pan_cache.get(pid)
-        if hit and time.time() - hit[1] < self.PAN_CACHE_TTL:
-            return hit[0]
-        page = self._fetch(pan.get("url") or "", referer=self.base + "/",
-                           timeout=self.PAN_RESOLVE_TIMEOUT)
-        share = self._pan_from_page(page)
-        if not share:
-            return ""
-        self._pan_cache[pid] = (share, time.time())
-        return share
-
-    def _pan_name(self, host):
-        for dom, cname in self.PAN_NAMES.items():
-            if host.endswith(dom):
-                return cname
-        return host or "网盘"
-
-    def _build_groups(self, d):
-        """把资源整理成 Atvp 的 group 结构：[{name, media:[{name,url}]}]"""
-        groups, order = [], []
-
-        if self.ENABLE_MAGNET_LINES and d["seeds"]:
-            media = []
-            for i, s in enumerate(d["seeds"]):
-                label = " ".join([x for x in ("·".join(s["features"][:3]), s["size"]) if x])
-                label = label or (s["title"][:30] or ("资源%d" % (i + 1)))
-                media.append({"name": "%02d. %s" % (i + 1, label), "url": s["url"]})
-            groups.append({"name": "磁力下载", "media": media})
-            order.append("磁力下载")
-
-        # 先按网盘类型分组、每类只挑前 N 条去解析（迅雷那种一页 20 条的别全抓）
-        pans, picked, seen = d["pans"], [], {}
-        for p in pans:
-            key = self._pan_name(p.get("host") or "")
-            if seen.get(key, 0) >= self.PAN_PER_GROUP_MAX:
-                continue
-            seen[key] = seen.get(key, 0) + 1
-            picked.append(p)
-            if len(picked) >= self.PAN_RESOLVE_MAX:
-                break
-
-        if picked:
-            # 并发预解析，把中转页换成真实分享链接（Atvp 的 /parse 只认分享链接）
-            shares = [""] * len(picked)
-            if ThreadPoolExecutor is not None and len(picked) > 1:
-                end_at = time.time() + self.PAN_RESOLVE_DEADLINE
-                step = self.PAN_RESOLVE_WORKERS
-                for i in range(0, len(picked), step):
-                    if time.time() >= end_at:
-                        break
-                    chunk = list(enumerate(picked[i:i + step], start=i))
-                    with ThreadPoolExecutor(max_workers=len(chunk)) as ex:
-                        futs = {ex.submit(self._pan_share, p): pos for pos, p in chunk}
-                        for fut in as_completed(futs):
-                            try:
-                                shares[futs[fut]] = fut.result()
-                            except Exception:
-                                pass
-            else:
-                shares = [self._pan_share(p) for p in picked]
-
-            buckets, names = {}, []
-            for p, share in zip(picked, shares):
-                if not share:
+        match = re.search(r'<ul class="seeds"[^>]*>(.*?)</ul>', page, re.S)
+        if match:
+            for row in re.findall(r"<li>(.*?)</li>", match.group(1), re.S)[:MAX_SEEDS]:
+                seed = re.search(r'seed_id=(\d+)', row)
+                if not seed:
                     continue
-                key = self._pan_name(p.get("host") or "")
-                if key not in buckets:
-                    buckets[key] = []
-                    names.append(key)
-                title = self._clean_pan_title(p.get("title") or "资源")
-                used = [m["name"] for m in buckets[key]]
-                n = 2
-                base_title = title
-                while title in used:
-                    title = "%s (%d)" % (base_title, n)
-                    n += 1
-                buckets[key].append({"name": title, "url": share})
+                tag = re.search(r"<a[^>]*>", row)
+                title = self._attr(tag.group(0), "title") if tag else ""
+                size = ""
+                size_match = re.search(r'class="size"[^>]*>([^<]*)<', row)
+                if size_match:
+                    size = size_match.group(1).strip()
+                features = [f.strip() for f in
+                            re.findall(r'class="seed-feature"[^>]*>([^<]*)<', row)
+                            if f.strip()]
+                detail["seeds"].append({"seed_id": seed.group(1), "title": title,
+                                        "size": size, "features": features})
 
-            for name in names:
-                if buckets[name]:
-                    groups.append({"name": name, "media": buckets[name]})
-                    order.append(name)
-        return groups, order
+        match = re.search(r'<ul class="pan-links"[^>]*>(.*?)</ul>', page, re.S)
+        if match:
+            for row in re.findall(r"<li>(.*?)</li>", match.group(1), re.S)[:MAX_PANS]:
+                tag_match = re.search(r"<a[^>]*>", row)
+                if not tag_match:
+                    continue
+                tag = tag_match.group(0)
+                href = self._attr(tag, "href")
+                pan_id = re.search(r"redirect_to=(pan_id_\d+)", href)
+                if not pan_id:
+                    continue
+                raw_url = "https://" + self._attr(tag, "data-link").lower()
+                detail["pans"].append({
+                    "pan_id": pan_id.group(1),
+                    "disk": self._identify_disk(raw_url) or "others",
+                    "title": self._clean_name(self._attr(tag, "title") or self._text(row)),
+                })
+        return detail
+
+    # ---- disk utils ----
+    def _identify_disk(self, url):
+        text = str(url or "").strip().lower()
+        for disk, patterns in DISK_PATTERNS:
+            for pattern in patterns:
+                if pattern in text:
+                    return disk
+        if text.startswith(("http://", "https://")):
+            return "others"
+        return ""
+
+    def _pan_title(self, disk):
+        return PAN_TITLES.get(disk or "", PAN_TITLES["others"])
+
+    def _encode_play_url(self, url):
+        return str(url or "").replace("#", "%23")
+
+    def _clean_name(self, name, limit=48):
+        text = self._text(name)
+        text = re.sub(r"\s*更新于.*$", "", text)
+        text = re.sub(r"[\s　]*(刚刚|今天|昨天|前天|\d+\s*(?:秒|分钟|小时|天|周|月)前)\s*$", "", text)
+        text = re.sub(r"\s*提取码[:：].*$", "", text)
+        text = re.sub(r"^[^\u4e00-\u9fa5A-Za-z0-9【\[(（]+", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) > limit:
+            text = text[:limit].rstrip()
+        return text or "资源"
+
+    def _seed_name(self, seed, index):
+        head = []
+        if seed["features"]:
+            head.append("·".join(seed["features"][:2]))
+        if seed["size"]:
+            head.append(seed["size"])
+        prefix = (" ".join(head) + " | ") if head else ""
+        title = self._clean_name(seed["title"], 44)
+        return "[%02d] %s%s" % (index, prefix, title)
+
+    # ---- link_start 解析 ----
+    def _cached_link(self, query):
+        with self._lock:
+            hit = self._link_cache.get(query)
+        if hit and time.time() - hit[1] < 900:
+            return hit[0]
+        return ""
+
+    def _remember_link(self, query, url):
+        if not url:
+            return ""
+        with self._lock:
+            if len(self._link_cache) >= 512:
+                self._link_cache.pop(next(iter(self._link_cache)))
+            self._link_cache[query] = (url, time.time())
+        return url
+
+    def _extract_link(self, page):
+        """中转页 -> 真实链接：磁力(base64 内嵌/明文) 或 网盘直达链接"""
+        if not page:
+            return ""
+        url = ""
+        for match in re.finditer(r'(?:const|let|var)\s+\w+\s*=\s*"([A-Za-z0-9+/=]{24,})"', page):
+            try:
+                decoded = base64.b64decode(match.group(1) + "===").decode("utf-8", "ignore")
+            except Exception:
+                continue
+            if decoded.lower().startswith("magnet:"):
+                url = decoded.strip()
+                break
+        if not url:
+            match = re.search(r"magnet:\?xt=urn:btih:[0-9a-zA-Z]{16,}[^\"'<>\s\\]*", page)
+            if match:
+                url = html_lib.unescape(match.group(0))
+        if not url:
+            match = re.search(r'class="direct-pan"[^>]*>', page)
+            if match:
+                url = self._attr(match.group(0), "href")
+            if not url:
+                match = re.search(r'href="(https?://[^"]*(?:pan\.baidu\.com|pan\.quark\.cn|'
+                                  r'drive\.uc\.cn|pan\.xunlei\.com|alipan\.com|'
+                                  r'aliyundrive\.com)[^"]*)"', page)
+                if match:
+                    url = html_lib.unescape(match.group(1))
+        return url
+
+    def _link_start(self, query):
+        """解析一条中转链接（网盘 -> 分享链接；磁力 -> magnet），带缓存"""
+        cached = self._cached_link(query)
+        if cached:
+            return cached
+        page = self._fetch("/link_start/?" + query, self.referer + "/", timeout=8)
+        url = self._extract_link(page)
+        if not url and page:
+            # 偶发截断/限流：再试一次
+            time.sleep(0.15)
+            url = self._extract_link(self._fetch("/link_start/?" + query,
+                                                 self.referer + "/", timeout=8))
+        return self._remember_link(query, url)
+
+    # ---- play fields ----
+    def _detail(self, rid):
+        with self._lock:
+            hit = self._detail_cache.get(rid)
+        if hit and time.time() - hit[1] < 900:
+            return hit[0]
+        detail = self._parse_detail_page(self._fetch("/movies/%s/" % rid, self.referer + "/"))
+        if not detail.get("name"):
+            # 偶发限流/网络抖动：重试一次，避免详情空返回
+            time.sleep(0.2)
+            detail = self._parse_detail_page(self._fetch("/movies/%s/" % rid, self.referer + "/"))
+        if detail.get("name"):
+            with self._lock:
+                if len(self._detail_cache) >= 128:
+                    self._detail_cache.pop(next(iter(self._detail_cache)))
+                self._detail_cache[rid] = (detail, time.time())
+        return detail
+
+    def _build_play_fields(self, detail):
+        """组装 play_from / play_url / group，与观影.py 同构
+
+        这里只产出站内中转链接（解析一条就要一次请求，详情页有 ~2s 死线，
+        批量解析会触发站点限流）。链接统一带 push:// 前缀走 Atvp 延迟解析：
+        用户点中资源后，Atvp 回调本插件 playerContent 现场换成真实分享链接，
+        再交给 POST /parse 挂载——/parse 不认站内中转页，不能直接透传。
+        """
+        buckets = {}
+        for pan in detail.get("pans") or []:
+            buckets.setdefault(pan["disk"], []).append(pan)
+        seeds = detail.get("seeds") or []
+
+        play_from = []
+        play_url = []
+        group = []
+
+        for disk in PAN_ORDER:
+            items = buckets.get(disk) or []
+            if not items:
+                continue
+            media = []
+            for pan in items:
+                url = self._absolute("/link_start/?redirect_to=" + pan["pan_id"])
+                media.append({"name": self._clean_name(pan.get("title")),
+                              "url": DEFERRED_PREFIX + self._encode_play_url(url)})
+            title = self._pan_title(disk)
+            for index, item in enumerate(media, 1):
+                play_from.append("%s%d" % (title, index) if len(media) > 1 else title)
+                play_url.append("%s$%s" % (item["name"], item["url"]))
+            group.append({"name": title, "media": media})
+
+        if seeds:
+            media = []
+            for index, seed in enumerate(seeds, 1):
+                url = self._absolute("/link_start/?seed_id=" + seed["seed_id"])
+                media.append({"name": self._seed_name(seed, index),
+                              "url": DEFERRED_PREFIX + self._encode_play_url(url)})
+            for index, item in enumerate(media, 1):
+                play_from.append("%s%d" % (MAGNET_TITLE, index) if len(media) > 1 else MAGNET_TITLE)
+                play_url.append("%s$%s" % (item["name"], item["url"]))
+            group.append({"name": MAGNET_TITLE, "media": media})
+
+        return "$$$".join(play_from), "$$$".join(play_url), group
+
+    # ---- handlers ----
+    def _normalize_vod_id(self, raw_id):
+        """详情 id 归一化：历史记录里可能出现各种形态
+        （sd_123 / 123 / atvp_detail:sd_123 / 详情页 URL），统一解析回站点数字 id"""
+        text = str(raw_id or "").strip()
+        if text.startswith(DEFERRED_PREFIX):
+            text = text[len(DEFERRED_PREFIX):]
+        if text.startswith("atvp_detail:"):
+            text = text[len("atvp_detail:"):]
+        if text.startswith("sd_"):
+            text = text[len("sd_"):]
+        match = re.search(r"(\d+)", text)
+        return match.group(1) if match else ""
+
+    def homeContent(self, filter):
+        return {"class": FIXED_CLASSES, "filters": FIXED_FILTERS}
+
+    def homeVideoContent(self):
+        try:
+            html, stamp = self._home_cache
+            if not html or time.time() - stamp > 600:
+                html = self._cached_page("/", lambda p, t=12: self._fetch("/", self.referer + "/", t))
+                if html:
+                    self._home_cache = (html, time.time())
+            return {"list": self._parse_covers(html)}
+        except Exception:
+            return {"list": []}
+
+    def categoryContent(self, tid, pg, filter, extend):
+        page = int(pg or 1)
+        tid = str(tid or "").strip()
+        if tid not in CLASS_PATHS:
+            return {"page": page, "pagecount": page, "limit": 0, "total": 0, "list": []}
+        try:
+            extend = extend if isinstance(extend, dict) else self._parse_extend(extend)
+            sort = str(extend.get("sort") or "update").strip()
+            if sort not in [v for _, v in SORT_PAIRS]:
+                sort = "update"
+
+            directory = CLASS_PATHS.get(tid)
+            if not directory:
+                if page > 1:
+                    return {"page": page, "pagecount": 1, "limit": 0, "total": 0, "list": []}
+                html = self._cached_page("/", lambda p, t=12: self._fetch("/", self.referer + "/", t))
+            else:
+                path = "/categories/%s/movies/?page=%d&order=%s" % (directory, page, sort)
+                html = self._cached_page(
+                    path,
+                    lambda p, t=12, _path=path: self._fetch(_path, self.referer + "/", t))
+
+            items = self._parse_covers(html)
+            pages = [int(x) for x in re.findall(r"\?page=(\d+)", html or "")] or [1]
+            pagecount = max(pages) if directory else 1
+            return {"page": page, "pagecount": pagecount, "limit": PAGE_SIZE,
+                    "total": pagecount * PAGE_SIZE if items else 0, "list": items}
+        except Exception:
+            return {"page": page, "pagecount": 0, "limit": 0, "total": 0, "list": []}
+
+    def searchContent(self, key, quick, pg="1"):
+        page = int(pg or 1)
+        keyword = str(key or "").strip()
+        if not keyword:
+            return {"page": page, "pagecount": page, "limit": 0, "total": 0, "list": []}
+        try:
+            path = "/s/%s/" % quote(re.sub(r"[/\\?#]+", " ", keyword), safe="")
+            if page > 1:
+                path += "?page=%d" % page
+            html = self._cached_page(
+                path, lambda p, t=12, _path=path: self._fetch(_path, self.referer + "/", t))
+            items = self._parse_covers(html)
+            pages = [int(x) for x in re.findall(r"\?page=(\d+)", html or "")] or [1]
+            return {"page": page, "pagecount": max(pages), "limit": PAGE_SIZE,
+                    "total": len(items), "list": items}
+        except Exception:
+            return {"page": page, "pagecount": 0, "limit": 0, "total": 0, "list": []}
 
     def detailContent(self, ids):
-        try:
-            raw = ids[0] if isinstance(ids, (list, tuple)) and ids else str(ids)
-            raw = str(raw)
-            for pre in ("atvp_detail:", "atvp_group:"):
-                if raw.startswith(pre):
-                    raw = raw[len(pre):]
-            m = re.search(r"(\d+)", raw)
-            if not m:
-                return {"list": []}
-            vid = m.group(1)
-            page = self._fetch("/movies/%s/" % vid, referer=self.base + "/")
-            if not page:
-                return {"list": []}
+        result = {"list": []}
+        for raw_id in ids:
+            rid = self._normalize_vod_id(raw_id)
+            if not rid:
+                continue
+            vod_id = "sd_%s" % rid
+            cached = self._cached_item(vod_id)
+            detail = self._detail(rid)
+            if not detail.get("name") and not cached.get("vod_name"):
+                continue
 
-            d = self._parse_detail(page, vid)
-            meta = d["meta"]
-
-            name = d["name"] or ("影片 %s" % vid)
-            year = ""
-            for key in ("首播", "上映日期", "上映时间", "年份"):
+            play_from, play_url, group = self._build_play_fields(detail)
+            meta = detail.get("meta") or {}
+            title = detail.get("name") or cached.get("vod_name") or ("影片 %s" % rid)
+            detail_lines = []
+            for key in ("导演", "编剧", "主演", "类型", "制片国家/地区", "语言",
+                        "首播", "集数", "单集片长", "又名", "豆瓣评分"):
                 if meta.get(key):
-                    ym = re.search(r"(19|20)\d{2}", meta[key])
-                    if ym:
-                        year = ym.group(0)
-                        break
+                    detail_lines.append("%s: %s" % (key, meta[key]))
+            content = detail.get("desc") or ""
+            if detail_lines:
+                content = (content + "\n\n" if content else "") + "\n".join(detail_lines)
+            content = (content + "\n\n" if content else "") + (
+                "【提示】本站为磁力 / 网盘资源索引，选中分享后由客户端网盘模块解析播放。")
 
-            remarks, ep_num = [], 0
-            if meta.get("集数"):
-                ep = re.search(r"\d+", meta["集数"])
-                if ep:
-                    ep_num = int(ep.group(0))
-            if ep_num > 1:
-                remarks.append("全%d集" % ep_num)
-            elif meta.get("单集片长"):
-                remarks.append(meta["单集片长"])
-            if meta.get("豆瓣评分") and meta["豆瓣评分"] not in ("0", "0.0"):
-                remarks.append("豆瓣%s" % meta["豆瓣评分"])
-            if not remarks and meta.get("类型"):
-                remarks.append(meta["类型"])
-
-            groups, group_names = self._build_groups(d)
-
-            info_lines = []
-            for k in ("资源更新于", "导演", "编剧", "主演", "类型",
-                      "制片国家/地区", "语言", "首播", "集数", "单集片长",
-                      "又名", "豆瓣评分", "常用标签"):
-                if meta.get(k):
-                    info_lines.append("%s: %s" % (k, meta[k]))
-
-            content = d["desc"].strip()
-            if info_lines:
-                content = (content + "\n\n" if content else "") + "\n".join(info_lines)
-            content += ("\n\n【提示】本站为磁力 / 网盘资源索引站，网盘线路由 alist-tvbox "
-                        "自动挂载，需先在「网盘账户」里登录对应网盘。")
-
-            vod = {
-                "vod_id": vid,
-                "vod_name": name,
-                "vod_pic": d["pic"],
-                "vod_year": year,
+            pan_count = len(detail.get("pans") or [])
+            seed_count = len(detail.get("seeds") or [])
+            remark_parts = []
+            if pan_count:
+                remark_parts.append("%d条网盘" % pan_count)
+            if seed_count:
+                remark_parts.append("%d条磁力" % seed_count)
+            result["list"].append({
+                "vod_id": vod_id,
+                "vod_name": title,
+                "vod_pic": detail.get("pic") or cached.get("vod_pic") or "",
+                "vod_year": cached.get("vod_year") or "",
                 "vod_area": meta.get("制片国家/地区", ""),
                 "vod_lang": meta.get("语言", ""),
                 "vod_actor": meta.get("主演", "").strip(" /"),
                 "vod_director": meta.get("导演", ""),
-                "vod_remarks": " · ".join(remarks),
                 "vod_content": content.strip(),
-            }
+                "vod_remarks": (" · ".join(remark_parts) if play_url else "无资源"),
+                "vod_play_from": play_from,
+                "vod_play_url": play_url,
+                "group": group,
+            })
+            self._remember_items(result["list"][-1:])
+        return result
 
-            # ★ group 优先：Atvp 会按组生成「夸克网盘 (3)」这样的二级目录
-            if groups:
-                vod["group"] = groups
-                # 非 Atvp 宿主（纯 T4）没有 group 概念，用每组的首条兜底
-                vod["vod_play_from"] = "$$$".join(group_names)
-                vod["vod_play_url"] = "$$$".join(
-                    "%s$%s" % (self._esc(g["media"][0]["name"]), g["media"][0]["url"])
-                    for g in groups if g.get("media"))
-            return {"list": [vod]}
-        except Exception:
-            return {"list": []}
-
-    # ------------------------------------------------------------------ 搜索
-    def searchContent(self, key, quick=False, pg="1"):
-        try:
-            kw = (key or "").strip()
-            if not kw:
-                return {"list": []}
-            kw = re.sub(r"[/\\?#]+", " ", kw)
-            kw = quote(kw, safe="")
-            try:
-                page_no = max(1, int(str(pg or "1")))
-            except Exception:
-                page_no = 1
-            path = "/s/%s/" % kw
-            if page_no > 1:
-                path += "?page=%d" % page_no
-            page = self._fetch(path, referer=self.base + "/")
-            if not page:
-                return {"list": []}
-            return {"list": self._parse_covers(page),
-                    "page": page_no,
-                    "pagecount": self._parse_pagecount(page, page_no)}
-        except Exception:
-            return {"list": []}
-
-    # ------------------------------------------------------------------ 播放解析
-    def _magnet_from_page(self, page):
-        if not page:
-            return ""
-        for m in re.finditer(r'(?:const|let|var)\s+\w+\s*=\s*"([A-Za-z0-9+/=]{24,})"', page):
-            try:
-                dec = base64.b64decode(m.group(1) + "===").decode("utf-8", "ignore")
-            except Exception:
-                continue
-            if dec.lower().startswith("magnet:"):
-                return dec.strip()
-        for m in re.finditer(r'atob\(\s*["\']([A-Za-z0-9+/=]{24,})["\']\s*\)', page):
-            try:
-                dec = base64.b64decode(m.group(1) + "===").decode("utf-8", "ignore")
-            except Exception:
-                continue
-            if dec.lower().startswith("magnet:"):
-                return dec.strip()
-        m = re.search(r"magnet:\?xt=urn:btih:[0-9a-zA-Z]{16,}[^\"'<>\s\\]*", page)
-        if m:
-            return html_lib.unescape(m.group(0))
-        return ""
-
-    def _pan_from_page(self, page):
-        if not page:
-            return ""
-        m = re.search(r'class="direct-pan"[^>]*>', page)
-        if m:
-            href = self._attr(m.group(0), "href")
-            if href:
-                return html_lib.unescape(href)
-        m = re.search(r'<a[^>]+href="(https?://[^"]*(?:pan\.baidu\.com|pan\.quark\.cn|'
-                      r'drive\.uc\.cn|pan\.xunlei\.com|alipan\.com|aliyundrive\.com)[^"]*)"',
-                      page)
-        return html_lib.unescape(m.group(1)) if m else ""
-
-    def _is_media(self, url):
-        return bool(url) and bool(self.MEDIA_RE.search(url))
-
-    def _extract_media(self, page, base_url=""):
-        if not page:
-            return ""
-        text = page.replace("\\/", "/").replace("&amp;", "&")
-        text = unquote(text)
-        found = []
-
-        def _push(u):
-            u = (u or "").strip().rstrip("),;]}>'\",，。")
-            if not u:
-                return
-            if u.startswith("//"):
-                u = "https:" + u
-            elif u.startswith("http"):
-                pass
-            elif u.startswith("/"):
-                u = urljoin(base_url or self.base, u)
-            else:
-                return
-            if not self._is_media(u):
-                return
-            found.append((0 if ".m3u8" in u.lower() else 1, u))
-
-        for m in re.finditer(r'https?://[^\s"\'<>\\\u4e00-\u9fa5]+', text):
-            _push(m.group(0))
-        for m in re.finditer(r'["\'](/[^\s"\'<>]*?\.(?:m3u8|mp4)(?:\?[^"\']*)?)["\']',
-                             text, re.I):
-            _push(m.group(1))
-        for m in re.finditer(r'(?:atob\(|base64,)\s*["\']?([A-Za-z0-9+/=]{24,})', text):
-            try:
-                dec = base64.b64decode(m.group(1) + "===").decode("utf-8", "ignore")
-            except Exception:
-                continue
-            for mm in re.finditer(r'https?://[^\s"\'<>\\]+', dec):
-                _push(mm.group(0))
-
-        if not found:
-            return ""
-        found.sort(key=lambda x: x[0])
-        seen = set()
-        for _, u in found:
-            key = u.split("?")[0]
-            if key in seen:
-                continue
-            seen.add(key)
-            return u
-        return ""
-
-    def playerContent(self, flag, id, vipFlags=None):
-        url = (id or "").strip()
-        header = {"User-Agent": self.UA, "Referer": self.base + "/", "Accept": "*/*"}
-        if not url:
-            return {"parse": 0, "playUrl": "", "url": "", "header": header}
-
-        low = url.lower()
-        if low.startswith("magnet:"):
-            return {"parse": 0, "playUrl": "", "url": url, "header": {}}
-        if self._is_media(url):
-            return {"parse": 0, "playUrl": "", "url": url, "header": header}
-
-        page_url = self._abs(url)
-        page = self._fetch(page_url, referer=self.base + "/")
-
-        if "/link_start/" in page_url:
-            magnet = self._magnet_from_page(page)
-            if magnet:
-                return {"parse": 0, "playUrl": "", "url": magnet, "header": {}}
-            pan = self._pan_from_page(page)
-            if pan:
-                return {"parse": 0, "playUrl": "", "url": pan, "header": header}
-
-        media = self._extract_media(page, page_url)
-        if media:
-            return {"parse": 0, "playUrl": "", "url": media, "header": header}
-
-        return {"parse": 0, "playUrl": "", "url": page_url, "header": header}
-
-    # ------------------------------------------------------------------ 其他
-    def isVideoFormat(self, url):
-        return self._is_media(url)
-
-    def manualVideoCheck(self):
-        return False
+    # ---- play ----
+    def playerContent(self, flag, id, vipFlags):
+        raw = str(id or "").strip()
+        if raw.startswith(DEFERRED_PREFIX):
+            raw = raw[len(DEFERRED_PREFIX):]
+        # 站内中转页（未在 detail 里解析到的分享）当场换成真实链接
+        if "/link_start/" in raw:
+            query = raw.split("/link_start/?", 1)[-1]
+            resolved = self._link_start(query)
+            if resolved:
+                raw = resolved
+        known = self._identify_disk(raw) or raw.startswith(
+            ("http://", "https://", "magnet:", "ed2k://", "thunder://"))
+        return {
+            "parse": 0,
+            "playUrl": "",
+            "url": raw if known else "",
+            "header": {"User-Agent": UA},
+        }
