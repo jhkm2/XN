@@ -4,6 +4,7 @@ import base64
 import gzip
 import html as html_lib
 import json
+import os
 import re
 import ssl
 import time
@@ -22,7 +23,7 @@ except Exception:
     requests = None
 
 try:
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 except Exception:
     ThreadPoolExecutor = None
 
@@ -38,13 +39,19 @@ class Spider(BaseSpider):
     # ★ T4/alist-tvbox 必填：网盘线路交给后端挂载解析
     backend_parse = True
 
+    # ★ 改动 6：本站对直连出口做 TCP RST，必须走代理才能拿到页面
+    #   填局域网 HTTP 代理；置空则只直连。也可用环境变量 HUBDOG_PROXY 覆盖。
+    PROXY = os.environ.get("HUBDOG_PROXY", "http://10.30.31.75:7890")
+
     # 磁力线路在 TVBox 客户端播不了，默认不输出
     ENABLE_MAGNET_LINES = False
 
     # 网盘链接预解析的并发/超时/上限（detail 会因此变慢，别调太大）
-    PAN_RESOLVE_WORKERS = 6
-    PAN_RESOLVE_TIMEOUT = 8
-    PAN_RESOLVE_MAX = 40
+    PAN_RESOLVE_WORKERS = 10
+    PAN_RESOLVE_TIMEOUT = 3
+    PAN_RESOLVE_MAX = 24
+    PAN_RESOLVE_DEADLINE = 6.0  # 预解析总预算(秒)，超时就少给几条，别把详情拖到超时
+    PAN_PER_GROUP_MAX = 4      # 每种网盘只解析前 N 条，控制 detail 耗时
     PAN_CACHE_TTL = 6 * 3600
 
     # 主域名 + 镜像，前一个不可用时自动切换
@@ -179,16 +186,27 @@ class Spider(BaseSpider):
         return raw.decode("utf-8", "ignore")
 
     def _http(self, url, referer=None, timeout=12, retries=1):
+        """★ 改动 6：先走 PROXY，失败再直连兜底（本站直连必被 RST）"""
         headers = dict(self.HEADERS)
         if referer:
             headers["Referer"] = referer
+        text = ""
+        if self.PROXY:
+            text = self._request(url, headers, timeout, retries, self.PROXY)
+        if not text:
+            text = self._request(url, headers, timeout, retries, None)
+        return text
+
+    def _request(self, url, headers, timeout, retries, proxy):
         for _ in range(retries + 1):
             try:
                 if requests is not None:
                     sess = self._session()
+                    kw = {"headers": headers, "timeout": timeout, "allow_redirects": True}
+                    if proxy:
+                        kw["proxies"] = {"http": proxy, "https": proxy}
                     try:
-                        r = sess.get(url, headers=headers, timeout=timeout,
-                                     allow_redirects=True, verify=True)
+                        r = sess.get(url, verify=True, **kw)
                     except Exception as e:
                         if "SSL" in type(e).__name__.upper() or "SSL" in str(e).upper():
                             try:
@@ -196,8 +214,7 @@ class Spider(BaseSpider):
                                 urllib3.disable_warnings()
                             except Exception:
                                 pass
-                            r = sess.get(url, headers=headers, timeout=timeout,
-                                         allow_redirects=True, verify=False)
+                            r = sess.get(url, verify=False, **kw)
                         else:
                             raise
                     if r.status_code >= 400:
@@ -206,11 +223,19 @@ class Spider(BaseSpider):
                         continue
                     return self._decode(r.content,
                                         r.headers.get("Content-Type", ""))
-                req = urllib.request.Request(url, headers=headers)
+                handlers = []
+                if proxy:
+                    handlers.append(urllib.request.ProxyHandler(
+                        {"http": proxy, "https": proxy}))
+                else:
+                    handlers.append(urllib.request.ProxyHandler({}))
                 ctx = ssl.create_default_context()
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
-                with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                handlers.append(urllib.request.HTTPSHandler(context=ctx))
+                opener = urllib.request.build_opener(*handlers)
+                req = urllib.request.Request(url, headers=headers)
+                with opener.open(req, timeout=timeout) as resp:
                     raw = resp.read()
                     ce = (resp.headers.get("Content-Encoding") or "").lower()
                     try:
@@ -666,19 +691,39 @@ class Spider(BaseSpider):
             groups.append({"name": "磁力下载", "media": media})
             order.append("磁力下载")
 
-        pans = d["pans"][:self.PAN_RESOLVE_MAX]
-        if pants := pans:
+        # 先按网盘类型分组、每类只挑前 N 条去解析（迅雷那种一页 20 条的别全抓）
+        pans, picked, seen = d["pans"], [], {}
+        for p in pans:
+            key = self._pan_name(p.get("host") or "")
+            if seen.get(key, 0) >= self.PAN_PER_GROUP_MAX:
+                continue
+            seen[key] = seen.get(key, 0) + 1
+            picked.append(p)
+            if len(picked) >= self.PAN_RESOLVE_MAX:
+                break
+
+        if picked:
             # 并发预解析，把中转页换成真实分享链接（Atvp 的 /parse 只认分享链接）
-            shares = [""] * len(pants)
-            if ThreadPoolExecutor is not None and len(pants) > 1:
-                with ThreadPoolExecutor(max_workers=self.PAN_RESOLVE_WORKERS) as ex:
-                    for idx, url in enumerate(ex.map(self._pan_share, pants)):
-                        shares[idx] = url
+            shares = [""] * len(picked)
+            if ThreadPoolExecutor is not None and len(picked) > 1:
+                end_at = time.time() + self.PAN_RESOLVE_DEADLINE
+                step = self.PAN_RESOLVE_WORKERS
+                for i in range(0, len(picked), step):
+                    if time.time() >= end_at:
+                        break
+                    chunk = list(enumerate(picked[i:i + step], start=i))
+                    with ThreadPoolExecutor(max_workers=len(chunk)) as ex:
+                        futs = {ex.submit(self._pan_share, p): pos for pos, p in chunk}
+                        for fut in as_completed(futs):
+                            try:
+                                shares[futs[fut]] = fut.result()
+                            except Exception:
+                                pass
             else:
-                shares = [self._pan_share(p) for p in pants]
+                shares = [self._pan_share(p) for p in picked]
 
             buckets, names = {}, []
-            for p, share in zip(pants, shares):
+            for p, share in zip(picked, shares):
                 if not share:
                     continue
                 key = self._pan_name(p.get("host") or "")
