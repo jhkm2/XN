@@ -1,4 +1,5 @@
 # coding=utf-8
+
 import base64
 import gzip
 import html as html_lib
@@ -16,6 +17,19 @@ except Exception:  # 本地自测 / 其他宿主兜底
     class BaseSpider(object):
         def init(self, extend=""):
             pass
+
+# 插件配置声明（alist-tvbox 网页端「订阅源 → 配置」自动渲染可视化表单；
+# 用户填写的值经 ext → data → init(extend) 原样传回，见 docs/plugin_config_schema.md）
+PLUGIN_CONFIG_SCHEMA = {
+    "description": "SeedHub（hubdog.cc）磁力/网盘源配置",
+    "allowAdditional": False,
+    "fields": [
+        {"key": "sites", "label": "站点地址", "type": "string", "required": False,
+         "aliases": ["site", "host", "url"],
+         "defaultValue": "https://hubdog.cc",
+         "placeholder": "https://hubdog.cc，多个用逗号分隔，留空用内置镜像清单"},
+    ],
+}
 
 PLUGIN_ID = "seedhub-hu60d0g"
 
@@ -82,6 +96,10 @@ PAN_ORDER = ["quark", "baidu", "xunlei", "uc", "aliyun", "123", "115",
 
 MAGNET_TITLE = "磁力"
 
+# Atvp 延迟解析前缀（与 Atvp.PUSH_PREFIX 对齐）：
+# 带 prefix 的链接在二级目录/播放上下文里被剥壳，点开时回调 playerContent 换真链
+DEFERRED_PREFIX = "push://"
+
 # 站点对并发很敏感：detail 里批量解析中转页会触发限流（实测 40 并发后详情页直接取不到），
 # 所以 detail 只产出中转链接，真正的解析放到 playerContent 点播时按需做（带缓存）。
 PAGE_SIZE = 20
@@ -126,6 +144,12 @@ class Spider(BaseSpider):
 
     # ---- config / host utils ----
     def _parse_extend(self, extend):
+        """兼容四种形态：dict / JSON 字符串 / base64(JSON) / 裸站点 URL。
+
+        Atvp 形态 1（.py 插件经包装层加载）传 {"token", "local_proxy_config",
+        <插件自定义字段原样合并在顶层>}；形态 2（旧宿主直载）可能带 api/token。
+        本插件只消费 sites/site/host/url，其余字段忽略即可。
+        """
         if isinstance(extend, dict):
             return extend
         text = str(extend or "").strip()
@@ -134,6 +158,14 @@ class Spider(BaseSpider):
         try:
             data = json.loads(text)
         except Exception:
+            # 兼容 base64(JSON) 形态的 ext
+            try:
+                padded = text + "=" * (-len(text) % 4)
+                data = json.loads(base64.b64decode(padded).decode("utf-8", "ignore"))
+            except Exception:
+                data = None
+            if isinstance(data, dict):
+                return data
             # 兼容直接传站点的写法：init("https://sidhub.cc")
             if re.match(r"(?i)^https?://", text):
                 return {"site": text}
@@ -552,7 +584,7 @@ class Spider(BaseSpider):
     def _detail(self, rid):
         with self._lock:
             hit = self._detail_cache.get(rid)
-        if hit and time.time() - hit[1] < 300:
+        if hit and time.time() - hit[1] < 900:
             return hit[0]
         detail = self._parse_detail_page(self._fetch("/movies/%s/" % rid, self.referer + "/"))
         if not detail.get("name"):
@@ -570,7 +602,9 @@ class Spider(BaseSpider):
         """组装 play_from / play_url / group，与观影.py 同构
 
         这里只产出站内中转链接（解析一条就要一次请求，详情页有 ~2s 死线，
-        批量解析会触发站点限流）；真正换成网盘分享链接的动作放在 playerContent。
+        批量解析会触发站点限流）。链接统一带 push:// 前缀走 Atvp 延迟解析：
+        用户点中资源后，Atvp 回调本插件 playerContent 现场换成真实分享链接，
+        再交给 POST /parse 挂载——/parse 不认站内中转页，不能直接透传。
         """
         buckets = {}
         for pan in detail.get("pans") or []:
@@ -589,7 +623,7 @@ class Spider(BaseSpider):
             for pan in items:
                 url = self._absolute("/link_start/?redirect_to=" + pan["pan_id"])
                 media.append({"name": self._clean_name(pan.get("title")),
-                              "url": self._encode_play_url(url)})
+                              "url": DEFERRED_PREFIX + self._encode_play_url(url)})
             title = self._pan_title(disk)
             for index, item in enumerate(media, 1):
                 play_from.append("%s%d" % (title, index) if len(media) > 1 else title)
@@ -600,7 +634,8 @@ class Spider(BaseSpider):
             media = []
             for index, seed in enumerate(seeds, 1):
                 url = self._absolute("/link_start/?seed_id=" + seed["seed_id"])
-                media.append({"name": self._seed_name(seed, index), "url": url})
+                media.append({"name": self._seed_name(seed, index),
+                              "url": DEFERRED_PREFIX + self._encode_play_url(url)})
             for index, item in enumerate(media, 1):
                 play_from.append("%s%d" % (MAGNET_TITLE, index) if len(media) > 1 else MAGNET_TITLE)
                 play_url.append("%s$%s" % (item["name"], item["url"]))
@@ -609,6 +644,19 @@ class Spider(BaseSpider):
         return "$$$".join(play_from), "$$$".join(play_url), group
 
     # ---- handlers ----
+    def _normalize_vod_id(self, raw_id):
+        """详情 id 归一化：历史记录里可能出现各种形态
+        （sd_123 / 123 / atvp_detail:sd_123 / 详情页 URL），统一解析回站点数字 id"""
+        text = str(raw_id or "").strip()
+        if text.startswith(DEFERRED_PREFIX):
+            text = text[len(DEFERRED_PREFIX):]
+        if text.startswith("atvp_detail:"):
+            text = text[len("atvp_detail:"):]
+        if text.startswith("sd_"):
+            text = text[len("sd_"):]
+        match = re.search(r"(\d+)", text)
+        return match.group(1) if match else ""
+
     def homeContent(self, filter):
         return {"class": FIXED_CLASSES, "filters": FIXED_FILTERS}
 
@@ -671,12 +719,10 @@ class Spider(BaseSpider):
     def detailContent(self, ids):
         result = {"list": []}
         for raw_id in ids:
-            vod_id = str(raw_id or "").strip()
-            if not vod_id.startswith("sd_"):
-                continue
-            rid = vod_id[3:]
+            rid = self._normalize_vod_id(raw_id)
             if not rid:
                 continue
+            vod_id = "sd_%s" % rid
             cached = self._cached_item(vod_id)
             detail = self._detail(rid)
             if not detail.get("name") and not cached.get("vod_name"):
@@ -724,8 +770,8 @@ class Spider(BaseSpider):
     # ---- play ----
     def playerContent(self, flag, id, vipFlags):
         raw = str(id or "").strip()
-        if raw.startswith("push://"):
-            raw = raw[7:]
+        if raw.startswith(DEFERRED_PREFIX):
+            raw = raw[len(DEFERRED_PREFIX):]
         # 站内中转页（未在 detail 里解析到的分享）当场换成真实链接
         if "/link_start/" in raw:
             query = raw.split("/link_start/?", 1)[-1]
