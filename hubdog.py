@@ -28,6 +28,10 @@ PLUGIN_CONFIG_SCHEMA = {
          "aliases": ["site", "host", "url"],
          "defaultValue": "https://hubdog.cc",
          "placeholder": "https://hubdog.cc，多个用逗号分隔，留空用内置镜像清单"},
+        {"key": "pic_proxy", "label": "封面图代理前缀", "type": "string", "required": False,
+         "description": "封面图床（sh1.pcie.pppoe.top）走 Cloudflare，客户端网络打不开该域名时，"
+                        "填一个自己可达的图片代理前缀；留空=直连图床",
+         "placeholder": "https://images.weserv.nl/?url={url}（{url} 替换为原图地址）"},
     ],
 }
 
@@ -106,6 +110,11 @@ PAGE_SIZE = 20
 MAX_SEEDS = 120
 MAX_PANS = 160
 
+# 列表页（首页/分类/搜索）TTL 缓存：设备到站点（Cloudflare）链路偏慢时，
+# 重进分类/翻回已看过的页直接秒出
+PAGE_CACHE_TTL = 300
+PAGE_CACHE_MAX = 64
+
 
 class Spider(BaseSpider):
     def __init__(self):
@@ -116,10 +125,12 @@ class Spider(BaseSpider):
         # 关键：告诉宿主“网盘/磁力链接由你解析”，插件只诚实回链
         self.backend_parse = True
         self.headers = {"User-Agent": UA, "Accept": ACCEPT}
+        self.pic_proxy = ""
         self._lock = threading.RLock()
         self._item_cache = {}
         self._link_cache = {}
         self._detail_cache = {}
+        self._page_cache = {}
         self._home_cache = ("", 0.0)
         self._activate_host(self.hosts[0])
 
@@ -128,10 +139,12 @@ class Spider(BaseSpider):
         sites = self._parse_sites(cfg.get("site") or cfg.get("sites") or cfg.get("url"))
         self.hosts = sites or [self._normalize_host(site)[0] for site in DEFAULT_HOSTS]
         self._activate_host(self.hosts[0])
+        self.pic_proxy = str(cfg.get("pic_proxy") or "").strip()
         with self._lock:
             self._item_cache.clear()
             self._link_cache.clear()
             self._detail_cache.clear()
+            self._page_cache.clear()
             self._home_cache = ("", 0.0)
         return None
 
@@ -215,6 +228,31 @@ class Spider(BaseSpider):
 
     def _ordered_hosts(self):
         return [self.host] + [h for h in self.hosts if h != self.host]
+
+    def _cover_url(self, pic):
+        """封面改写：配置了 pic_proxy 时经图代中转（图床 sh1.pcie.pppoe.top 走
+        Cloudflare，部分客户端网络 DNS/SNI 层打不开该域名，直连会全灰）"""
+        pic = str(pic or "").strip()
+        if not pic or not self.pic_proxy:
+            return pic
+        proxy = self.pic_proxy
+        if "{url}" in proxy:
+            return proxy.replace("{url}", quote(pic, safe=""))
+        return proxy + quote(pic, safe="")
+
+    def _cached_page(self, path, fetcher, timeout=12):
+        """列表页 TTL 缓存：只缓存成功结果，重进分类/翻页不重复抓站"""
+        with self._lock:
+            hit = self._page_cache.get(path)
+        if hit and time.time() - hit[1] < PAGE_CACHE_TTL:
+            return hit[0]
+        html = fetcher(path, timeout)
+        if html:
+            with self._lock:
+                if len(self._page_cache) >= PAGE_CACHE_MAX and path not in self._page_cache:
+                    self._page_cache.pop(next(iter(self._page_cache)))
+                self._page_cache[path] = (html, time.time())
+        return html
 
     # ---- http ----
     def _build_headers(self, extra=None):
@@ -405,7 +443,7 @@ class Spider(BaseSpider):
             items.append({
                 "vod_id": "sd_%s" % rid,
                 "vod_name": title,
-                "vod_pic": cover,
+                "vod_pic": self._cover_url(cover),
                 "vod_year": year,
                 "vod_area": area,
                 "vod_actor": actor,
@@ -425,7 +463,7 @@ class Spider(BaseSpider):
             detail["name"] = self._text(match.group(1)).lstrip("#").strip()
         match = re.search(r'<div class="cover-container">\s*<img[^>]*>', page)
         if match:
-            detail["pic"] = self._attr(match.group(0), "src")
+            detail["pic"] = self._cover_url(self._attr(match.group(0), "src"))
             if detail["pic"].startswith("//"):
                 detail["pic"] = "https:" + detail["pic"]
 
@@ -664,7 +702,7 @@ class Spider(BaseSpider):
         try:
             html, stamp = self._home_cache
             if not html or time.time() - stamp > 600:
-                html = self._fetch("/", self.referer + "/")
+                html = self._cached_page("/", lambda p, t=12: self._fetch("/", self.referer + "/", t))
                 if html:
                     self._home_cache = (html, time.time())
             return {"list": self._parse_covers(html)}
@@ -686,10 +724,12 @@ class Spider(BaseSpider):
             if not directory:
                 if page > 1:
                     return {"page": page, "pagecount": 1, "limit": 0, "total": 0, "list": []}
-                html = self._fetch("/", self.referer + "/")
+                html = self._cached_page("/", lambda p, t=12: self._fetch("/", self.referer + "/", t))
             else:
-                html = self._fetch("/categories/%s/movies/?page=%d&order=%s"
-                                   % (directory, page, sort), self.referer + "/")
+                path = "/categories/%s/movies/?page=%d&order=%s" % (directory, page, sort)
+                html = self._cached_page(
+                    path,
+                    lambda p, t=12, _path=path: self._fetch(_path, self.referer + "/", t))
 
             items = self._parse_covers(html)
             pages = [int(x) for x in re.findall(r"\?page=(\d+)", html or "")] or [1]
