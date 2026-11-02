@@ -18,6 +18,13 @@
 #             直链；playerContent 同时内置了通用 m3u8 / mp4 提取逻辑（页面直链、
 #             JS 转义、URL 编码、base64 内嵌均可识别），若条目本身或日后站点提供
 #             流媒体地址，会直接返回可播地址。
+#
+#  播放列表结构（两层，避免一点就播、看着像漏了选集）：
+#     第一层 vod_play_from = 资源类型：磁力下载(N) / 夸克网盘(N) / 百度网盘(N) …
+#     第二层 vod_play_url  = 该类型下的具体资源文件：
+#                            资源01｜4K蓝光｜17.36G｜09-10｜更18集
+#     点条目才进 playerContent 解析磁力 / 网盘直链；条目名里的“更N集/全N集/
+#     第A-B集”来自资源标题，方便按集数范围挑选，而不是被误认成“第N集”。
 # =============================================================================
 
 import base64
@@ -503,6 +510,52 @@ class Spider(BaseSpider):
         }
 
     # ------------------------------------------------------------------ 详情
+    def _quality_tag(self, title):
+        """从种子文件名推断画质，站点没标特征标签时兜底"""
+        t = title or ""
+        tags = []
+        if re.search(r"2160p|\b4k\b|uhd", t, re.I):
+            tags.append("4K")
+        elif re.search(r"1080p", t, re.I):
+            tags.append("1080P")
+        elif re.search(r"720p", t, re.I):
+            tags.append("720P")
+        if re.search(r"remux", t, re.I):
+            tags.append("Remux")
+        elif re.search(r"blu-?ray|bdrip|蓝光", t, re.I):
+            tags.append("蓝光")
+        elif re.search(r"web-?dl|webrip", t, re.I):
+            tags.append("WEB")
+        return "·".join(tags[:2])
+
+    def _ep_hint(self, title):
+        """从资源标题里提取集数范围，便于用户在第二层判断这份资源能覆盖到第几集"""
+        t = (title or "").strip()
+        if not t:
+            return ""
+        # 更新至18集 / 更18集 / 全集29集 / 29集全
+        m = re.search(r"(更新至|更新到|更新|更至|更|全集|全)\s*(\d{1,4})\s*集", t)
+        if m:
+            n = int(m.group(2))
+            if n > 1:
+                return ("全%d集" % n) if m.group(1).startswith("全") else ("更%d集" % n)
+        m = re.search(r"(\d{1,4})\s*集全", t)
+        if m:
+            n = int(m.group(1))
+            if n > 1:
+                return "全%d集" % n
+        # 第01-18集 / 1~18集
+        m = re.search(r"第?\s*(\d{1,3})\s*[-~至]\s*(\d{1,3})\s*集", t)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if b > a >= 0:
+                return "第%d-%d集" % (a, b)
+        # S01E05
+        m = re.search(r"S\d{1,2}E(\d{1,3})", t, re.I)
+        if m:
+            return "EP%s" % m.group(1)
+        return ""
+
     def _clean_pan_title(self, title, limit=42):
         """清理网盘资源标题：去掉更新时间尾巴、压缩空白"""
         t = (title or "").strip()
@@ -661,19 +714,28 @@ class Spider(BaseSpider):
             if not remarks and meta.get("类型"):
                 remarks.append(meta["类型"])
 
-            # 播放列表：磁力线路 + 各网盘线路
+            # 播放列表：两层结构
+            #   第一层 vod_play_from = 资源类型（磁力下载 / 夸克 / 百度 / 迅雷 / UC）
+            #   第二层 vod_play_url  = 该类型下的具体资源文件（每个都是整包，不是单集）
             froms, urls = [], []
 
             if d["seeds"]:
                 eps = []
                 for i, s in enumerate(d["seeds"]):
-                    label = " ".join([x for x in
-                                      ("·".join(s["features"][:3]), s["size"]) if x])
-                    if not label:
-                        label = (s["title"][:30] or ("资源%d" % (i + 1)))
-                    label = "%02d. %s" % (i + 1, label)
+                    feats = "·".join(s["features"][:3]) or self._quality_tag(s["title"])
+                    parts = [feats, s["size"]]
+                    dm = re.search(r"-(\d{2})-(\d{2})", s["time"] or "")
+                    if dm:
+                        parts.append("%s-%s" % (dm.group(1), dm.group(2)))
+                    hint = self._ep_hint(s["title"])
+                    if hint:
+                        parts.append(hint)
+                    parts = [x for x in parts if x]
+                    if not parts:
+                        parts = [s["title"][:28] or "整包"]
+                    label = "资源%02d｜%s" % (i + 1, "｜".join(parts))
                     eps.append("%s$%s" % (self._esc(label), s["url"]))
-                froms.append("磁力下载")
+                froms.append("磁力下载(%d)" % len(d["seeds"]))
                 urls.append("#".join(eps))
 
             if d["pans"]:
@@ -694,13 +756,20 @@ class Spider(BaseSpider):
                 for key in order:
                     eps, used = [], {}
                     for i, p in enumerate(groups[key]):
-                        title = self._clean_pan_title(p["title"] or ("资源%d" % (i + 1)))
+                        raw = p["title"] or "整包"
+                        hint = self._ep_hint(raw)  # 从原始标题提，避免被截断后丢失
+                        title = self._clean_pan_title(raw, limit=34 if hint else 38)
+                        # 集数范围放在序号后面，扫一眼就知道这份资源更新到第几集
+                        if hint:
+                            title = "资源%02d｜%s｜%s" % (i + 1, hint, title)
+                        else:
+                            title = "资源%02d｜%s" % (i + 1, title)
                         n = used.get(title, 0) + 1
                         used[title] = n
                         if n > 1:
                             title = "%s (%d)" % (title, n)
                         eps.append("%s$%s" % (self._esc(title), p["url"]))
-                    froms.append(key)
+                    froms.append("%s(%d)" % (key, len(groups[key])))
                     urls.append("#".join(eps))
 
             # 无磁力也无网盘：留空，让壳子显示“暂无内容”，不塞空条目
@@ -715,8 +784,17 @@ class Spider(BaseSpider):
             content = d["desc"].strip()
             if info_lines:
                 content = (content + "\n\n" if content else "") + "\n".join(info_lines)
-            content += ("\n\n【提示】本站为磁力 / 网盘资源索引站，点击播放会解析出"
-                        "磁力链接或网盘分享链接，请搭配支持磁力的播放器 / 下载工具使用。")
+            # 使用顺序放在最前面，第一眼就能看到“这是两层选择”
+            guide = ("【使用顺序】\n"
+                     "① 先选资源类型：磁力下载 / 夸克 / 百度 / 迅雷 / UC 等（播放器上方的线路）\n"
+                     "② 再选具体资源文件：条目名形如「资源01｜4K蓝光｜17.36G｜更18集」，"
+                     "每条都是一个整包，不是单集\n"
+                     "③ 点进去后才进入播放 / 取链接环节\n"
+                     "注：本站只提供整包磁力与网盘分享，没有单集直链，"
+                     "因此第二层选的是“哪一份资源”，不是“第几集”。")
+            content = guide + ("\n\n" + content if content else "")
+            content += ("\n\n【提示】磁力 / 网盘需要配套工具：磁力用支持 BT 的播放器或下载器，"
+                        "网盘需先转存到自己的网盘再播放。")
 
             vod = {
                 "vod_id": vid,
